@@ -1,4 +1,5 @@
 use std::io;
+use strum::VariantArray;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -12,7 +13,7 @@ fn main() -> io::Result<()> {
     ratatui::run(|terminal| App::default().run(terminal))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, VariantArray)]
 enum WizardStep {
     #[default]
     ProjectType,
@@ -28,7 +29,7 @@ impl WizardStep {
     fn title(&self) -> &str {
         match self {
             WizardStep::ProjectType => "Project Type",
-            WizardStep::Vcs => "Version Control",
+            WizardStep::Vcs => "Version Control System",
             WizardStep::Languages => "Languages",
             WizardStep::Database => "Database",
             WizardStep::Remotes => "Remotes",
@@ -36,35 +37,11 @@ impl WizardStep {
             WizardStep::Summary => "Summary",
         }
     }
-
-    fn next(&self) -> Option<WizardStep> {
-        match self {
-            WizardStep::ProjectType => Some(WizardStep::Vcs),
-            WizardStep::Vcs => Some(WizardStep::Languages),
-            WizardStep::Languages => Some(WizardStep::Database),
-            WizardStep::Database => Some(WizardStep::Remotes),
-            WizardStep::Remotes => Some(WizardStep::Extras),
-            WizardStep::Extras => Some(WizardStep::Summary),
-            WizardStep::Summary => None,
-        }
-    }
-
-    fn prev(&self) -> Option<WizardStep> {
-        match self {
-            WizardStep::ProjectType => None,
-            WizardStep::Vcs => Some(WizardStep::ProjectType),
-            WizardStep::Languages => Some(WizardStep::Vcs),
-            WizardStep::Database => Some(WizardStep::Languages),
-            WizardStep::Remotes => Some(WizardStep::Database),
-            WizardStep::Extras => Some(WizardStep::Remotes),
-            WizardStep::Summary => Some(WizardStep::Extras),
-        }
-    }
 }
 
 #[derive(Debug, Default)]
 struct App {
-    step: WizardStep,
+    step_index: usize,
     exit: bool,
 }
 
@@ -78,7 +55,7 @@ impl App {
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let title = Line::from(format!(" init_blaze — {} ", self.step.title())).bold();
+        let title = Line::from(format!(" init_blaze — {} ", self.current_step().title())).bold();
         let instructions = Line::from(vec![
             " Back ".into(),
             "<Left/H> ".blue().bold(),
@@ -92,7 +69,7 @@ impl App {
             .title(title.centered())
             .title_bottom(instructions.centered());
 
-        let content = format!("Step: {}", self.step.title());
+        let content = format!("Step: {}", self.current_step().title());
 
         let paragraph = Paragraph::new(content).centered().block(block);
 
@@ -103,20 +80,26 @@ impl App {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') => self.exit = true,
-                KeyCode::Right | KeyCode::Char('l') => {
-                    if let Some(next) = self.step.next() {
-                        self.step = next;
-                    }
-                }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    if let Some(prev) = self.step.prev() {
-                        self.step = prev;
-                    }
-                }
+                KeyCode::Right | KeyCode::Char('l') => self.next(),
+                KeyCode::Left | KeyCode::Char('h') => self.prev(),
                 _ => {}
             },
             _ => {}
         }
         Ok(())
+    }
+
+    fn current_step(&self) -> &WizardStep {
+        &WizardStep::VARIANTS[self.step_index]
+    }
+
+    fn next(&mut self) {
+        if self.step_index + 1 < WizardStep::VARIANTS.len() {
+            self.step_index += 1;
+        }
+    }
+
+    fn prev(&mut self) {
+        self.step_index = self.step_index.saturating_sub(1);
     }
 }
