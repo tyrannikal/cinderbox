@@ -55,7 +55,7 @@ impl App {
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let title = Line::from(format!(" init_blaze — {} ", self.current_step().title())).bold();
+        let title = Line::from(format!(" cinderbox — {} ", self.current_step().title())).bold();
         let instructions = Line::from(vec![
             " Back ".into(),
             "<Left/H> ".blue().bold(),
