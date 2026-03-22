@@ -1,5 +1,5 @@
 use std::io;
-use strum::VariantArray;
+use strum::{Display, VariantArray};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -10,24 +10,26 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, VariantArray)]
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
 enum ProjectType {
     New,
     Existing,
 }
 
-impl ProjectType {
-    fn label(&self) -> &str {
-        match self {
-            ProjectType::New => "New Project",
-            ProjectType::Existing => "Existing Project",
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+enum Vcs {
+    Git,
+    #[strum(to_string = "Jujutsu (jj)")]
+    Jujutsu,
+    #[strum(to_string = "Subversion (svn)")]
+    Svn,
+    None,
 }
 
 #[derive(Debug, Default)]
 struct ProjectConfig {
     project_type: Option<ProjectType>,
+    vcs: Option<Vcs>,
 }
 
 fn main() -> io::Result<()> {
@@ -109,16 +111,22 @@ impl App {
         frame.render_widget(config, config_area);
     }
 
+    fn render_select_list<T: std::fmt::Display>(&self, variants: &[T]) -> String {
+        variants
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let marker = if i == self.cursor { "▸ " } else { "  " };
+                format!("{marker}{v}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn step_content(&self) -> String {
         match self.current_step() {
-            WizardStep::ProjectType => {
-                let mut lines = Vec::new();
-                for (i, variant) in ProjectType::VARIANTS.iter().enumerate() {
-                    let marker = if i == self.cursor { "▸ " } else { "  " };
-                    lines.push(format!("{}{}", marker, variant.label()));
-                }
-                lines.join("\n")
-            }
+            WizardStep::ProjectType => self.render_select_list(ProjectType::VARIANTS),
+            WizardStep::Vcs => self.render_select_list(Vcs::VARIANTS),
             _ => format!("Step: {}", self.current_step().title()),
         }
     }
@@ -127,8 +135,13 @@ impl App {
         let mut lines = Vec::new();
 
         match &self.config.project_type {
-            Some(pt) => lines.push(format!("Type: {}", pt.label())),
+            Some(pt) => lines.push(format!("Type: {pt}")),
             None => lines.push("Type: —".to_string()),
+        }
+
+        match &self.config.vcs {
+            Some(vcs) => lines.push(format!("VCS: {vcs}")),
+            None => lines.push("VCS: —".to_string()),
         }
 
         if lines.iter().all(|l| l.ends_with('—')) {
@@ -142,7 +155,7 @@ impl App {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Char('q') => self.exit = true,
-                KeyCode::Right | KeyCode::Char('l') => self.next(),
+                KeyCode::Right | KeyCode::Char('l') => self.select_or_next(),
                 KeyCode::Left | KeyCode::Char('h') => self.prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.cursor_down(),
                 KeyCode::Up | KeyCode::Char('k') => self.cursor_up(),
@@ -161,6 +174,7 @@ impl App {
     fn cursor_max(&self) -> usize {
         match self.current_step() {
             WizardStep::ProjectType => ProjectType::VARIANTS.len().saturating_sub(1),
+            WizardStep::Vcs => Vcs::VARIANTS.len().saturating_sub(1),
             _ => 0,
         }
     }
@@ -175,10 +189,21 @@ impl App {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
+    fn select_or_next(&mut self) {
+        match self.current_step() {
+            WizardStep::ProjectType | WizardStep::Vcs => self.select(),
+            _ => self.next(),
+        }
+    }
+
     fn select(&mut self) {
         match self.current_step() {
             WizardStep::ProjectType => {
                 self.config.project_type = Some(ProjectType::VARIANTS[self.cursor]);
+                self.next();
+            }
+            WizardStep::Vcs => {
+                self.config.vcs = Some(Vcs::VARIANTS[self.cursor]);
                 self.next();
             }
             _ => {}
@@ -191,6 +216,11 @@ impl App {
                 .config
                 .project_type
                 .and_then(|pt| ProjectType::VARIANTS.iter().position(|v| *v == pt))
+                .unwrap_or(0),
+            WizardStep::Vcs => self
+                .config
+                .vcs
+                .and_then(|vcs| Vcs::VARIANTS.iter().position(|v| *v == vcs))
                 .unwrap_or(0),
             _ => 0,
         };
