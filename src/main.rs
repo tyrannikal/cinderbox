@@ -1,5 +1,5 @@
 use std::io;
-use strum::{Display, VariantArray};
+use strum::{Display, EnumCount, VariantArray};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
@@ -19,6 +19,9 @@ struct ProjectConfig {
     project_type: Option<ProjectType>,
     vcs: Option<Vcs>,
     languages: Vec<Language>,
+    database: Option<Database>,
+    remotes: Vec<Remote>,
+    extras: Vec<Extra>,
 }
 
 #[derive(Debug, Default, VariantArray, Display)]
@@ -35,13 +38,27 @@ enum WizardStep {
     Summary,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+impl WizardStep {
+    fn option_count(&self) -> usize {
+        match self {
+            Self::ProjectType => ProjectType::COUNT,
+            Self::Vcs => Vcs::COUNT,
+            Self::Languages => Language::COUNT,
+            Self::Database => Database::COUNT,
+            Self::Remotes => Remote::COUNT,
+            Self::Extras => Extra::COUNT,
+            Self::Summary => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
 enum ProjectType {
     New,
     Existing,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
 enum Vcs {
     Git,
     #[strum(to_string = "Jujutsu (jj)")]
@@ -51,7 +68,7 @@ enum Vcs {
     None,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
 enum Language {
     Rust,
     Go,
@@ -69,12 +86,41 @@ enum Language {
     Lua,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
+enum Database {
+    PostgreSQL,
+    MySQL,
+    SQLite,
+    MongoDB,
+    Redis,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
+enum Remote {
+    GitHub,
+    Codeberg,
+    GitLab,
+    Bitbucket,
+    #[strum(to_string = "Self-hosted")]
+    SelfHosted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, EnumCount, Display)]
+enum Extra {
+    #[strum(to_string = ".gitignore")]
+    Gitignore,
+    README,
+    LICENSE,
+}
 #[derive(Debug, Default)]
 struct App {
     step_index: usize,
     cursor: usize,
     config: ProjectConfig,
     selected_languages: Vec<Language>,
+    selected_remotes: Vec<Remote>,
+    selected_extras: Vec<Extra>,
     exit: bool,
 }
 
@@ -95,7 +141,10 @@ impl App {
         // Wizard panel (left 2/3)
         let title = Line::from(format!(" cinderbox — {} ", self.current_step())).bold();
         let mut instruction_spans = vec![" Back ".into(), "<Left/H> ".blue().bold()];
-        if matches!(self.current_step(), WizardStep::Languages) {
+        if matches!(
+            self.current_step(),
+            WizardStep::Languages | WizardStep::Remotes | WizardStep::Extras
+        ) {
             instruction_spans.push(" Toggle ".into());
             instruction_spans.push("<Enter> ".blue().bold());
             instruction_spans.push(" Confirm ".into());
@@ -160,6 +209,13 @@ impl App {
             WizardStep::Languages => {
                 self.render_multi_select_list(Language::VARIANTS, &self.selected_languages)
             }
+            WizardStep::Database => self.render_select_list(Database::VARIANTS),
+            WizardStep::Remotes => {
+                self.render_multi_select_list(Remote::VARIANTS, &self.selected_remotes)
+            }
+            WizardStep::Extras => {
+                self.render_multi_select_list(Extra::VARIANTS, &self.selected_extras)
+            }
             _ => format!("Step: {}", self.current_step()),
         }
     }
@@ -189,6 +245,25 @@ impl App {
             lines.push(format!("Languages: {}", langs.join(", ")));
         }
 
+        match &self.config.database {
+            Some(db) => lines.push(format!("Database: {db}")),
+            None => lines.push("Database: —".to_string()),
+        }
+
+        if self.config.remotes.is_empty() {
+            lines.push("Remotes: —".to_string());
+        } else {
+            let remotes: Vec<String> = self.config.remotes.iter().map(|r| r.to_string()).collect();
+            lines.push(format!("Remotes: {}", remotes.join(", ")));
+        }
+
+        if self.config.extras.is_empty() {
+            lines.push("Extras: —".to_string());
+        } else {
+            let extras: Vec<String> = self.config.extras.iter().map(|e| e.to_string()).collect();
+            lines.push(format!("Extras: {}", extras.join(", ")));
+        }
+
         if lines.iter().all(|l| l.ends_with('—')) {
             return "No selections yet.".to_string();
         }
@@ -216,17 +291,8 @@ impl App {
         &WizardStep::VARIANTS[self.step_index]
     }
 
-    fn cursor_max(&self) -> usize {
-        match self.current_step() {
-            WizardStep::ProjectType => ProjectType::VARIANTS.len().saturating_sub(1),
-            WizardStep::Vcs => Vcs::VARIANTS.len().saturating_sub(1),
-            WizardStep::Languages => Language::VARIANTS.len().saturating_sub(1),
-            _ => 0,
-        }
-    }
-
     fn cursor_down(&mut self) {
-        if self.cursor < self.cursor_max() {
+        if self.cursor + 1 < self.current_step().option_count() {
             self.cursor += 1;
         }
     }
@@ -237,9 +303,17 @@ impl App {
 
     fn select_or_next(&mut self) {
         match self.current_step() {
-            WizardStep::ProjectType | WizardStep::Vcs => self.select(),
+            WizardStep::ProjectType | WizardStep::Vcs | WizardStep::Database => self.select(),
             WizardStep::Languages => {
                 self.config.languages = self.selected_languages.clone();
+                self.next();
+            }
+            WizardStep::Remotes => {
+                self.config.remotes = self.selected_remotes.clone();
+                self.next();
+            }
+            WizardStep::Extras => {
+                self.config.extras = self.selected_extras.clone();
                 self.next();
             }
             _ => self.next(),
@@ -264,6 +338,26 @@ impl App {
                     self.selected_languages.push(lang);
                 }
             }
+            WizardStep::Database => {
+                self.config.database = Some(Database::VARIANTS[self.cursor]);
+                self.next();
+            }
+            WizardStep::Remotes => {
+                let remote = Remote::VARIANTS[self.cursor];
+                if let Some(pos) = self.selected_remotes.iter().position(|r| *r == remote) {
+                    self.selected_remotes.remove(pos);
+                } else {
+                    self.selected_remotes.push(remote);
+                }
+            }
+            WizardStep::Extras => {
+                let extra = Extra::VARIANTS[self.cursor];
+                if let Some(pos) = self.selected_extras.iter().position(|e| *e == extra) {
+                    self.selected_extras.remove(pos);
+                } else {
+                    self.selected_extras.push(extra);
+                }
+            }
             _ => {}
         }
     }
@@ -282,6 +376,19 @@ impl App {
                 .unwrap_or(0),
             WizardStep::Languages => {
                 self.selected_languages = self.config.languages.clone();
+                0
+            }
+            WizardStep::Database => self
+                .config
+                .database
+                .and_then(|db| Database::VARIANTS.iter().position(|v| *v == db))
+                .unwrap_or(0),
+            WizardStep::Remotes => {
+                self.selected_remotes = self.config.remotes.clone();
+                0
+            }
+            WizardStep::Extras => {
+                self.selected_extras = self.config.extras.clone();
                 0
             }
             _ => 0,
