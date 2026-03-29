@@ -1,7 +1,7 @@
 use std::io;
 use strum::{Display, VariantArray};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Layout},
@@ -177,6 +177,8 @@ impl App {
                 instruction_spans.push("<Right/L> ".blue().bold());
             }
         }
+        instruction_spans.push(" Peek ".into());
+        instruction_spans.push("<Shift+←/→> ".blue().bold());
         instruction_spans.push(" Quit ".into());
         instruction_spans.push("<Q> ".blue().bold());
 
@@ -255,13 +257,7 @@ impl App {
     }
 
     fn config_summary(&self) -> String {
-        let lines = self.get_summary();
-
-        if lines.iter().all(|l| l.ends_with("—")) {
-            return "No selections yet.".to_string();
-        }
-
-        lines.join("\n")
+        self.get_summary().join("\n")
     }
 
     fn final_summary(&self) -> String {
@@ -272,16 +268,24 @@ impl App {
 
     fn get_summary(&self) -> Vec<String> {
         let c = &self.config;
+        let name_display = if c.project_name.is_empty() {
+            "—".to_string()
+        } else {
+            c.project_name.clone()
+        };
+        let location_display = if c.project_location.is_empty() {
+            "—".to_string()
+        } else {
+            c.project_location.clone()
+        };
         let mut lines = vec![
             format!(
                 "Project Type: {}",
                 c.project_type.map_or("—".to_string(), |v| v.to_string())
             ),
+            format!("  Name: {name_display}"),
+            format!("  Location: {location_display}"),
         ];
-        if !c.project_name.is_empty() {
-            lines.push(format!("Name: {}", c.project_name));
-            lines.push(format!("Location: {}", c.project_location));
-        }
         lines.extend([
             format!("VCS: {}", c.vcs.map_or("—".to_string(), |v| v.to_string())),
             Self::format_config_list("Languages", &c.languages, "—"),
@@ -326,6 +330,24 @@ impl App {
     fn handle_events(&mut self) -> io::Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+                // Global peek navigation (Shift+Left/Right) — always works,
+                // bypasses handlers and validation so users can freely move between steps
+                if shift {
+                    match key.code {
+                        KeyCode::Left => {
+                            self.peek_prev();
+                            return Ok(());
+                        }
+                        KeyCode::Right => {
+                            self.peek_next();
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Delegate to step handler for ProjectType (before global keys,
                 // since text input needs to capture all keys including 'q')
                 if matches!(self.current_step(), WizardStep::ProjectType) {
@@ -470,6 +492,20 @@ impl App {
     }
 
     fn prev(&mut self) {
+        if self.step_index > 0 {
+            self.step_index -= 1;
+            self.restore_cursor();
+        }
+    }
+
+    fn peek_next(&mut self) {
+        if self.step_index + 1 < WizardStep::VARIANTS.len() {
+            self.step_index += 1;
+            self.restore_cursor();
+        }
+    }
+
+    fn peek_prev(&mut self) {
         if self.step_index > 0 {
             self.step_index -= 1;
             self.restore_cursor();
