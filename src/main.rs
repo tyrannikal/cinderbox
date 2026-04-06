@@ -164,6 +164,9 @@ impl App {
         if self.step_index == 0 && self.project_type_handler.in_details() {
             instruction_spans.push(" Back ".into());
             instruction_spans.push("<Esc> ".blue().bold());
+        } else if self.step_index == 0 && self.project_type_handler.is_expanded() {
+            instruction_spans.push(" Collapse ".into());
+            instruction_spans.push("<←/H> ".blue().bold());
         } else if self.step_index > 0 {
             instruction_spans.push(" Back ".into());
             instruction_spans.push("<←/H> ".blue().bold());
