@@ -68,6 +68,10 @@ impl Default for ProjectTypeHandler {
 }
 
 impl ProjectTypeHandler {
+    pub fn in_details(&self) -> bool {
+        matches!(self.phase, Phase::Details)
+    }
+
     /// Restore cursor position from existing config when navigating back
     pub fn restore_from_config(&mut self, config: &ProjectConfig) {
         if let Some(pt) = &config.project_type {
@@ -81,31 +85,48 @@ impl ProjectTypeHandler {
             // If we have a name/location already, go back to details phase
             if !config.project_name.is_empty() {
                 self.phase = Phase::Details;
-                self.name_input = TextInput::new("Project Name").with_value(&config.project_name);
-                self.location_input =
-                    TextInput::new("Location").with_value(&config.project_location);
+                match choice {
+                    TypeChoice::New => {
+                        self.name_input =
+                            TextInput::new("Project Name").with_value(&config.project_name);
+                        self.location_input =
+                            TextInput::new("Location").with_value(&config.project_location);
+                    }
+                    TypeChoice::Existing => {
+                        self.location_input =
+                            TextInput::new("Location").with_value(&config.project_location);
+                    }
+                }
             }
         }
     }
 
     fn full_path(&self) -> PathBuf {
-        PathBuf::from(&self.location_input.value).join(&self.name_input.value)
+        match self.choice {
+            TypeChoice::New => {
+                PathBuf::from(&self.location_input.value).join(&self.name_input.value)
+            }
+            TypeChoice::Existing => PathBuf::from(&self.location_input.value),
+        }
+    }
+
+    fn derived_name(&self) -> String {
+        let path = PathBuf::from(&self.location_input.value);
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
     }
 
     fn validate(&mut self) {
-        let name = &self.name_input.value;
-        let location = &self.location_input.value;
-
-        if name.is_empty() {
-            self.validation_msg = "Project name is required.".to_string();
-            return;
-        }
-
         let path = self.full_path();
 
         match self.choice {
             TypeChoice::New => {
-                if path.exists() {
+                let name = &self.name_input.value;
+                let location = &self.location_input.value;
+                if name.is_empty() {
+                    self.validation_msg = "Project name is required.".to_string();
+                } else if path.exists() {
                     self.validation_msg =
                         format!("Warning: {} already exists.", path.display());
                 } else if !PathBuf::from(location).exists() {
@@ -116,7 +137,10 @@ impl ProjectTypeHandler {
                 }
             }
             TypeChoice::Existing => {
-                if !path.exists() {
+                let location = &self.location_input.value;
+                if location.is_empty() {
+                    self.validation_msg = "Location is required.".to_string();
+                } else if !path.exists() {
                     self.validation_msg =
                         format!("Warning: {} does not exist.", path.display());
                 } else {
@@ -127,17 +151,15 @@ impl ProjectTypeHandler {
     }
 
     fn is_valid(&self) -> bool {
-        let name = &self.name_input.value;
-        if name.is_empty() {
-            return false;
-        }
-
-        let path = self.full_path();
         match self.choice {
             TypeChoice::New => {
-                !path.exists() && PathBuf::from(&self.location_input.value).exists()
+                !self.name_input.value.is_empty()
+                    && !self.full_path().exists()
+                    && PathBuf::from(&self.location_input.value).exists()
             }
-            TypeChoice::Existing => path.exists(),
+            TypeChoice::Existing => {
+                !self.location_input.value.is_empty() && self.full_path().exists()
+            }
         }
     }
 
@@ -156,29 +178,55 @@ impl ProjectTypeHandler {
     }
 
     fn render_details(&self, frame: &mut Frame, area: Rect) {
-        let [name_area, location_area, _spacer, msg_area] = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .areas(area);
+        match self.choice {
+            TypeChoice::New => {
+                let [name_area, location_area, _spacer, msg_area] = Layout::vertical([
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .areas(area);
 
-        self.name_input
-            .render(frame, name_area, self.active_field == 0);
-        self.location_input
-            .render(frame, location_area, self.active_field == 1);
+                self.name_input
+                    .render(frame, name_area, self.active_field == 0);
+                self.location_input
+                    .render(frame, location_area, self.active_field == 1);
 
-        if !self.validation_msg.is_empty() {
-            let style = if self.validation_msg.starts_with("Warning") {
-                ratatui::style::Style::default().yellow()
-            } else {
-                ratatui::style::Style::default().green()
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(self.validation_msg.as_str()).style(style)),
-                msg_area,
-            );
+                if !self.validation_msg.is_empty() {
+                    let style = if self.validation_msg.starts_with("Warning") {
+                        ratatui::style::Style::default().yellow()
+                    } else {
+                        ratatui::style::Style::default().green()
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(self.validation_msg.as_str()).style(style)),
+                        msg_area,
+                    );
+                }
+            }
+            TypeChoice::Existing => {
+                let [location_area, _spacer, msg_area] = Layout::vertical([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .areas(area);
+
+                self.location_input.render(frame, location_area, true);
+
+                if !self.validation_msg.is_empty() {
+                    let style = if self.validation_msg.starts_with("Warning") {
+                        ratatui::style::Style::default().yellow()
+                    } else {
+                        ratatui::style::Style::default().green()
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(self.validation_msg.as_str()).style(style)),
+                        msg_area,
+                    );
+                }
+            }
         }
     }
 
@@ -207,6 +255,13 @@ impl ProjectTypeHandler {
     }
 
     fn handle_details(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
+        match self.choice {
+            TypeChoice::New => self.handle_details_new(key, config),
+            TypeChoice::Existing => self.handle_details_existing(key, config),
+        }
+    }
+
+    fn handle_details_new(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
         match key {
             KeyCode::Tab | KeyCode::Down => {
                 self.active_field = (self.active_field + 1) % 2;
@@ -218,10 +273,7 @@ impl ProjectTypeHandler {
             }
             KeyCode::Enter => {
                 if self.is_valid() {
-                    config.project_type = Some(match self.choice {
-                        TypeChoice::New => crate::ProjectType::New,
-                        TypeChoice::Existing => crate::ProjectType::Existing,
-                    });
+                    config.project_type = Some(crate::ProjectType::New);
                     config.project_name = self.name_input.value.clone();
                     config.project_location = self.location_input.value.clone();
                     StepResult::Done
@@ -246,6 +298,31 @@ impl ProjectTypeHandler {
             }
         }
     }
+
+    fn handle_details_existing(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
+        match key {
+            KeyCode::Enter => {
+                if self.is_valid() {
+                    config.project_type = Some(crate::ProjectType::Existing);
+                    config.project_name = self.derived_name();
+                    config.project_location = self.location_input.value.clone();
+                    StepResult::Done
+                } else {
+                    self.validate();
+                    StepResult::Continue
+                }
+            }
+            KeyCode::Esc => {
+                self.phase = Phase::Selecting;
+                StepResult::Continue
+            }
+            key => {
+                self.location_input.handle_input(key);
+                self.validate();
+                StepResult::Continue
+            }
+        }
+    }
 }
 
 impl StepHandler for ProjectTypeHandler {
@@ -264,37 +341,36 @@ impl StepHandler for ProjectTypeHandler {
     }
 
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String> {
-        if config.project_name.is_empty() {
-            return vec![];
-        }
-
-        let path = PathBuf::from(&config.project_location).join(&config.project_name);
-
         match config.project_type {
             Some(crate::ProjectType::New) => {
+                if config.project_name.is_empty() {
+                    return vec![];
+                }
+                let path =
+                    PathBuf::from(&config.project_location).join(&config.project_name);
                 vec![format!("Create directory: {}", path.display())]
             }
             Some(crate::ProjectType::Existing) => {
-                vec![format!("Use existing directory: {}", path.display())]
+                if config.project_location.is_empty() {
+                    return vec![];
+                }
+                vec![format!(
+                    "Use existing directory: {}",
+                    config.project_location
+                )]
             }
             None => vec![],
         }
     }
 
     fn execute(&self, config: &ProjectConfig) -> std::io::Result<()> {
-        if config.project_name.is_empty() {
-            return Ok(());
-        }
-
-        let path = PathBuf::from(&config.project_location).join(&config.project_name);
-
-        match config.project_type {
-            Some(crate::ProjectType::New) => {
+        if let Some(crate::ProjectType::New) = config.project_type {
+            if !config.project_name.is_empty() {
+                let path =
+                    PathBuf::from(&config.project_location).join(&config.project_name);
                 std::fs::create_dir_all(&path)?;
             }
-            Some(crate::ProjectType::Existing) | None => {}
         }
-
         Ok(())
     }
 }

@@ -146,7 +146,7 @@ impl App {
             terminal.draw(|frame| self.draw(frame))?;
             self.handle_events()?;
         }
-        // Execute all steps if confirmed
+
         if self.confirmed {
             self.project_type_handler.execute(&self.config)?;
         }
@@ -160,13 +160,20 @@ impl App {
 
         // Wizard panel (left 2/3)
         let title = Line::from(format!(" cinderbox — {} ", self.current_step())).bold();
-        let mut instruction_spans = vec![" Back ".into(), "<Left/H> ".blue().bold()];
+        let mut instruction_spans = vec![];
+        if self.step_index == 0 && self.project_type_handler.in_details() {
+            instruction_spans.push(" Back ".into());
+            instruction_spans.push("<Esc> ".blue().bold());
+        } else if self.step_index > 0 {
+            instruction_spans.push(" Back ".into());
+            instruction_spans.push("<←/H> ".blue().bold());
+        }
         match self.current_step() {
             WizardStep::Languages | WizardStep::Remotes | WizardStep::Extras => {
                 instruction_spans.push(" Toggle ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
                 instruction_spans.push(" Confirm ".into());
-                instruction_spans.push("<Right/L> ".blue().bold());
+                instruction_spans.push("<→/L> ".blue().bold());
             }
             WizardStep::Summary => {
                 instruction_spans.push(" Confirm ".into());
@@ -174,7 +181,7 @@ impl App {
             }
             _ => {
                 instruction_spans.push(" Next ".into());
-                instruction_spans.push("<Right/L> ".blue().bold());
+                instruction_spans.push("<Enter/→/L> ".blue().bold());
             }
         }
         instruction_spans.push(" Peek ".into());
@@ -351,7 +358,10 @@ impl App {
                 // Delegate to step handler for ProjectType (before global keys,
                 // since text input needs to capture all keys including 'q')
                 if matches!(self.current_step(), WizardStep::ProjectType) {
-                    match self.project_type_handler.handle_input(key.code, &mut self.config) {
+                    match self
+                        .project_type_handler
+                        .handle_input(key.code, &mut self.config)
+                    {
                         StepResult::Done => self.next(),
                         StepResult::Back => self.prev(),
                         StepResult::Quit => self.exit = true,
