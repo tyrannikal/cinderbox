@@ -432,12 +432,11 @@ impl StepHandler for ProjectTypeHandler {
     }
 
     fn execute(&self, config: &ProjectConfig) -> std::io::Result<()> {
-        if let Some(crate::ProjectType::New) = config.project_type {
-            if !config.project_name.is_empty() {
-                let path =
-                    PathBuf::from(&config.project_location).join(&config.project_name);
-                std::fs::create_dir_all(&path)?;
-            }
+        if let Some(crate::ProjectType::New) = config.project_type
+            && !config.project_name.is_empty()
+        {
+            let path = PathBuf::from(&config.project_location).join(&config.project_name);
+            std::fs::create_dir_all(&path)?;
         }
         Ok(())
     }

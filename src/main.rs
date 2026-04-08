@@ -13,7 +13,7 @@ use ratatui::{
 mod steps;
 mod widgets;
 
-use steps::{StepHandler, StepResult, project_type::ProjectTypeHandler};
+use steps::{StepHandler, StepResult, project_type::ProjectTypeHandler, vcs::VcsHandler};
 
 fn main() -> io::Result<()> {
     let mut app = App::default();
@@ -25,11 +25,13 @@ fn main() -> io::Result<()> {
 }
 
 #[derive(Debug, Default)]
-struct ProjectConfig {
+pub struct ProjectConfig {
     project_type: Option<ProjectType>,
     project_name: String,
     project_location: String,
     vcs: Option<Vcs>,
+    default_branch: String,
+    jj_colocate: bool,
     languages: Vec<Language>,
     database: Option<Database>,
     remotes: Vec<Remote>,
@@ -71,12 +73,10 @@ enum ProjectType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
-enum Vcs {
+pub enum Vcs {
     Git,
     #[strum(to_string = "Jujutsu (jj)")]
     Jujutsu,
-    #[strum(to_string = "Subversion (svn)")]
-    Svn,
     None,
 }
 
@@ -138,6 +138,7 @@ struct App {
     confirmed: bool,
     exit: bool,
     project_type_handler: ProjectTypeHandler,
+    vcs_handler: VcsHandler,
 }
 
 impl App {
@@ -149,6 +150,7 @@ impl App {
 
         if self.confirmed {
             self.project_type_handler.execute(&self.config)?;
+            self.vcs_handler.execute(&self.config)?;
         }
         Ok(())
     }
@@ -161,10 +163,14 @@ impl App {
         // Wizard panel (left 2/3)
         let title = Line::from(format!(" cinderbox — {} ", self.current_step())).bold();
         let mut instruction_spans = vec![];
-        if self.step_index == 0 && self.project_type_handler.in_details() {
+        let pt_in_details = self.step_index == 0 && self.project_type_handler.in_details();
+        let pt_expanded = self.step_index == 0 && self.project_type_handler.is_expanded();
+        let vcs_in_details = self.step_index == 1 && self.vcs_handler.in_details();
+        let vcs_expanded = self.step_index == 1 && self.vcs_handler.is_expanded();
+        if pt_in_details || vcs_in_details {
             instruction_spans.push(" Back ".into());
             instruction_spans.push("<Esc> ".blue().bold());
-        } else if self.step_index == 0 && self.project_type_handler.is_expanded() {
+        } else if pt_expanded || vcs_expanded {
             instruction_spans.push(" Collapse ".into());
             instruction_spans.push("<←/H> ".blue().bold());
         } else if self.step_index > 0 {
@@ -182,6 +188,17 @@ impl App {
                 instruction_spans.push(" Confirm ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
             }
+            WizardStep::ProjectType if self.project_type_handler.in_details() => {
+                // SubField focus: only Enter advances; →/L are captured by the text input.
+                instruction_spans.push(" Next ".into());
+                instruction_spans.push("<Enter> ".blue().bold());
+            }
+            WizardStep::Vcs if self.vcs_handler.in_details() => {
+                // SubField focus: only Enter advances; →/L are captured by the
+                // colocate radio toggle or the default-branch text input.
+                instruction_spans.push(" Next ".into());
+                instruction_spans.push("<Enter> ".blue().bold());
+            }
             _ => {
                 instruction_spans.push(" Next ".into());
                 instruction_spans.push("<Enter/→/L> ".blue().bold());
@@ -197,12 +214,17 @@ impl App {
             .title(title.centered())
             .title_bottom(instructions.centered());
 
-        // For ProjectType, delegate rendering to the handler
+        // For handler-backed steps, delegate rendering
         match self.current_step() {
             WizardStep::ProjectType => {
                 let inner = wizard_block.inner(wizard_area);
                 frame.render_widget(wizard_block, wizard_area);
                 self.project_type_handler.render(frame, inner);
+            }
+            WizardStep::Vcs => {
+                let inner = wizard_block.inner(wizard_area);
+                frame.render_widget(wizard_block, wizard_area);
+                self.vcs_handler.render(frame, inner);
             }
             _ => {
                 let content = self.step_content();
@@ -251,7 +273,7 @@ impl App {
     fn step_content(&self) -> String {
         match self.current_step() {
             WizardStep::ProjectType => String::new(), // handled by ProjectTypeHandler
-            WizardStep::Vcs => self.render_select_list(Vcs::VARIANTS),
+            WizardStep::Vcs => String::new(),          // handled by VcsHandler
             WizardStep::Languages => {
                 self.render_multi_select_list(Language::VARIANTS, &self.selected_languages)
             }
@@ -296,8 +318,36 @@ impl App {
             format!("  Name: {name_display}"),
             format!("  Location: {location_display}"),
         ];
+        lines.push(format!(
+            "VCS: {}",
+            c.vcs.map_or("—".to_string(), |v| v.to_string())
+        ));
+        match c.vcs {
+            Some(Vcs::Git) => {
+                let branch = if c.default_branch.is_empty() {
+                    "(default)".to_string()
+                } else {
+                    c.default_branch.clone()
+                };
+                lines.push(format!("  Default branch: {branch}"));
+            }
+            Some(Vcs::Jujutsu) => {
+                lines.push(format!(
+                    "  Mode: {}",
+                    if c.jj_colocate { "Colocated with git" } else { "Native" }
+                ));
+                if c.jj_colocate {
+                    let branch = if c.default_branch.is_empty() {
+                        "(default)".to_string()
+                    } else {
+                        c.default_branch.clone()
+                    };
+                    lines.push(format!("  Default branch: {branch}"));
+                }
+            }
+            _ => {}
+        }
         lines.extend([
-            format!("VCS: {}", c.vcs.map_or("—".to_string(), |v| v.to_string())),
             Self::format_config_list("Languages", &c.languages, "—"),
             format!(
                 "Database: {}",
@@ -322,7 +372,8 @@ impl App {
         let mut lines = vec!["Review your selections:\n".to_string()];
         lines.extend(self.get_summary());
 
-        let actions = self.project_type_handler.planned_actions(&self.config);
+        let mut actions = self.project_type_handler.planned_actions(&self.config);
+        actions.extend(self.vcs_handler.planned_actions(&self.config));
         if !actions.is_empty() {
             lines.push(String::new());
             lines.push("Planned actions:".to_string());
@@ -347,30 +398,42 @@ impl App {
                 if shift {
                     match key.code {
                         KeyCode::Left => {
-                            self.peek_prev();
+                            self.prev();
                             return Ok(());
                         }
                         KeyCode::Right => {
-                            self.peek_next();
+                            self.next();
                             return Ok(());
                         }
                         _ => {}
                     }
                 }
 
-                // Delegate to step handler for ProjectType (before global keys,
-                // since text input needs to capture all keys including 'q')
-                if matches!(self.current_step(), WizardStep::ProjectType) {
-                    match self
-                        .project_type_handler
-                        .handle_input(key.code, &mut self.config)
-                    {
-                        StepResult::Done => self.next(),
-                        StepResult::Back => self.prev(),
-                        StepResult::Quit => self.exit = true,
-                        StepResult::Continue => {}
+                // Delegate to step handlers (before global keys, since text
+                // inputs need to capture all keys including 'q')
+                match self.current_step() {
+                    WizardStep::ProjectType => {
+                        match self
+                            .project_type_handler
+                            .handle_input(key.code, &mut self.config)
+                        {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    WizardStep::Vcs => {
+                        match self.vcs_handler.handle_input(key.code, &mut self.config) {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
                 }
 
                 // Inline handling for other steps (to be migrated later)
@@ -405,18 +468,18 @@ impl App {
 
     fn select_or_next(&mut self) {
         match self.current_step() {
-            WizardStep::ProjectType => {} // handled by ProjectTypeHandler
-            WizardStep::Vcs | WizardStep::Database => self.select(),
+            WizardStep::ProjectType | WizardStep::Vcs => {} // handled by their handlers
+            WizardStep::Database => self.select(),
             WizardStep::Languages => {
-                self.config.languages = self.selected_languages.clone();
+                self.config.languages = std::mem::take(&mut self.selected_languages);
                 self.next();
             }
             WizardStep::Remotes => {
-                self.config.remotes = self.selected_remotes.clone();
+                self.config.remotes = std::mem::take(&mut self.selected_remotes);
                 self.next();
             }
             WizardStep::Extras => {
-                self.config.extras = self.selected_extras.clone();
+                self.config.extras = std::mem::take(&mut self.selected_extras);
                 self.next();
             }
             WizardStep::Summary => {}
@@ -425,11 +488,7 @@ impl App {
 
     fn select(&mut self) {
         match self.current_step() {
-            WizardStep::ProjectType => {} // handled by ProjectTypeHandler
-            WizardStep::Vcs => {
-                self.config.vcs = Some(Vcs::VARIANTS[self.cursor]);
-                self.next();
-            }
+            WizardStep::ProjectType | WizardStep::Vcs => {} // handled by their handlers
             WizardStep::Languages => {
                 let lang = Language::VARIANTS[self.cursor];
                 if let Some(pos) = self.selected_languages.iter().position(|l| *l == lang) {
@@ -471,13 +530,12 @@ impl App {
                 self.project_type_handler.restore_from_config(&self.config);
                 return;
             }
-            WizardStep::Vcs => self
-                .config
-                .vcs
-                .and_then(|vcs| Vcs::VARIANTS.iter().position(|v| *v == vcs))
-                .unwrap_or(0),
+            WizardStep::Vcs => {
+                self.vcs_handler.restore_from_config(&self.config);
+                return;
+            }
             WizardStep::Languages => {
-                self.selected_languages = self.config.languages.clone();
+                self.selected_languages.clone_from(&self.config.languages);
                 0
             }
             WizardStep::Database => self
@@ -486,11 +544,11 @@ impl App {
                 .and_then(|db| Database::VARIANTS.iter().position(|v| *v == db))
                 .unwrap_or(0),
             WizardStep::Remotes => {
-                self.selected_remotes = self.config.remotes.clone();
+                self.selected_remotes.clone_from(&self.config.remotes);
                 0
             }
             WizardStep::Extras => {
-                self.selected_extras = self.config.extras.clone();
+                self.selected_extras.clone_from(&self.config.extras);
                 0
             }
             _ => 0,
@@ -511,17 +569,4 @@ impl App {
         }
     }
 
-    fn peek_next(&mut self) {
-        if self.step_index + 1 < WizardStep::VARIANTS.len() {
-            self.step_index += 1;
-            self.restore_cursor();
-        }
-    }
-
-    fn peek_prev(&mut self) {
-        if self.step_index > 0 {
-            self.step_index -= 1;
-            self.restore_cursor();
-        }
-    }
 }

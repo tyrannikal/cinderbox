@@ -4,6 +4,7 @@ use ratatui::{Frame, layout::Rect};
 use crate::ProjectConfig;
 
 pub mod project_type;
+pub mod vcs;
 
 pub enum StepResult {
     Continue,
