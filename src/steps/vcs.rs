@@ -37,7 +37,7 @@ impl Default for VcsHandler {
             focus: Focus::Choice,
             expanded: None,
             choice_cursor: 0,
-            default_branch_input: TextInput::new("Default branch"),
+            default_branch_input: TextInput::new("Default branch").with_value("main"),
             jj_colocate: true,
         }
     }
@@ -87,7 +87,7 @@ impl VcsHandler {
     /// the colocate radio row). Only meaningful when `focus == SubField(_)`.
     fn current_subfield_is_text(&self, field: usize) -> bool {
         match self.expanded {
-            Some(Vcs::Git) => true, // field 0 = text input
+            Some(Vcs::Git) => true,           // field 0 = text input
             Some(Vcs::Jujutsu) => field == 1, // field 0 = radio, field 1 = text input
             _ => false,
         }
@@ -123,7 +123,11 @@ impl VcsHandler {
         let yes_marker = if self.jj_colocate { "●" } else { "○" };
         let no_marker = if self.jj_colocate { "○" } else { "●" };
         let text = format!("Colocate with git:  {yes_marker} Yes   {no_marker} No");
-        let color = if focused { Color::White } else { Color::DarkGray };
+        let color = if focused {
+            Color::White
+        } else {
+            Color::DarkGray
+        };
         let style = Style::default().fg(color);
         frame.render_widget(Paragraph::new(Line::from(text).style(style)), area);
     }
@@ -146,7 +150,9 @@ impl VcsHandler {
                 if choice == Vcs::None {
                     // None has no sub-fields — commit immediately and advance
                     self.expanded = None;
-                    self.commit_to_config_for_none(config);
+                    config.vcs = Some(Vcs::None);
+                    config.default_branch.clear();
+                    config.jj_colocate = false;
                     return StepResult::Done;
                 }
                 self.expanded = Some(choice);
@@ -163,12 +169,6 @@ impl VcsHandler {
             }
             _ => StepResult::Continue,
         }
-    }
-
-    fn commit_to_config_for_none(&self, config: &mut ProjectConfig) {
-        config.vcs = Some(Vcs::None);
-        config.default_branch.clear();
-        config.jj_colocate = false;
     }
 
     fn handle_subfield(
@@ -194,11 +194,7 @@ impl VcsHandler {
                     self.focus = Focus::SubField(field + 1);
                 } else {
                     // Past last sub-field — jump to next choice in the list
-                    let next_idx = VCS_CHOICES
-                        .iter()
-                        .position(|v| *v == choice)
-                        .unwrap_or(0)
-                        + 1;
+                    let next_idx = VCS_CHOICES.iter().position(|v| *v == choice).unwrap_or(0) + 1;
                     if next_idx < VCS_CHOICES.len() {
                         self.choice_cursor = next_idx;
                         self.focus = Focus::Choice;
