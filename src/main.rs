@@ -415,7 +415,7 @@ impl App {
                     WizardStep::ProjectType => {
                         match self
                             .project_type_handler
-                            .handle_input(key.code, &mut self.config)
+                            .handle_input(key, &mut self.config)
                         {
                             StepResult::Done => self.next(),
                             StepResult::Back => self.prev(),
@@ -425,7 +425,7 @@ impl App {
                         return Ok(());
                     }
                     WizardStep::Vcs => {
-                        match self.vcs_handler.handle_input(key.code, &mut self.config) {
+                        match self.vcs_handler.handle_input(key, &mut self.config) {
                             StepResult::Done => self.next(),
                             StepResult::Back => self.prev(),
                             StepResult::Quit => self.exit = true,

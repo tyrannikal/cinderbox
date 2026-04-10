@@ -1,4 +1,4 @@
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -323,7 +323,8 @@ impl StepHandler for VcsHandler {
         self.render_choice_line(frame, areas[idx], Vcs::None, 2);
     }
 
-    fn handle_input(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
+    fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
+        let key = key.code;
         match self.focus {
             Focus::Choice => self.handle_choice(key, config),
             Focus::SubField(n) => self.handle_subfield(key, n, config),

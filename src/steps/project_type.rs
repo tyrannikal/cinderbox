@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
+    style::{Color, Style},
     text::Line,
-    widgets::Paragraph,
+    widgets::{Block, Clear, FrameExt, Paragraph},
 };
+use ratatui_explorer::FileExplorer;
 
 use crate::ProjectConfig;
 use crate::widgets::text_input::TextInput;
@@ -18,6 +20,7 @@ enum Focus {
     #[default]
     Choice,
     SubField(usize),
+    Browsing,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -38,7 +41,17 @@ impl std::fmt::Display for TypeChoice {
     }
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for ProjectTypeHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectTypeHandler")
+            .field("focus", &self.focus)
+            .field("expanded", &self.expanded)
+            .field("choice_cursor", &self.choice_cursor)
+            .field("file_explorer", &self.file_explorer.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
 pub struct ProjectTypeHandler {
     focus: Focus,
     expanded: Option<TypeChoice>,
@@ -46,6 +59,7 @@ pub struct ProjectTypeHandler {
     name_input: TextInput,
     location_input: TextInput,
     validation_msg: String,
+    file_explorer: Option<FileExplorer>,
 }
 
 impl Default for ProjectTypeHandler {
@@ -61,13 +75,14 @@ impl Default for ProjectTypeHandler {
             name_input: TextInput::new("Project Name"),
             location_input: TextInput::new("Location").with_value(cwd),
             validation_msg: String::new(),
+            file_explorer: None,
         }
     }
 }
 
 impl ProjectTypeHandler {
     pub fn in_details(&self) -> bool {
-        matches!(self.focus, Focus::SubField(_))
+        matches!(self.focus, Focus::SubField(_) | Focus::Browsing)
     }
 
     pub fn is_expanded(&self) -> bool {
@@ -174,9 +189,22 @@ impl ProjectTypeHandler {
 
     fn max_subfield(&self) -> usize {
         match self.expanded {
-            Some(TypeChoice::New) => 1, // 0=name, 1=location
-            Some(TypeChoice::Existing) => 0, // 0=location
+            Some(TypeChoice::New) => 2,      // 0=name, 1=location, 2=browse
+            Some(TypeChoice::Existing) => 1, // 0=location, 1=browse
             None => 0,
+        }
+    }
+
+    /// Returns the sub-field index of the browse button for the current choice.
+    fn browse_subfield(&self) -> usize {
+        self.max_subfield()
+    }
+
+    /// Returns the sub-field index of the location input for the current choice.
+    fn location_subfield(&self) -> usize {
+        match self.expanded {
+            Some(TypeChoice::New) => 1,
+            _ => 0,
         }
     }
 
@@ -191,6 +219,35 @@ impl ProjectTypeHandler {
         let marker = if is_highlighted { "▸ " } else { "  " };
         let text = format!("{marker}{choice}");
         frame.render_widget(Paragraph::new(text), area);
+    }
+
+    fn render_browse_button(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let style = if focused {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(Paragraph::new(Line::from("[ Browse ]").style(style)), area);
+    }
+
+    fn render_file_explorer(&self, frame: &mut Frame, area: Rect) {
+        let Some(ref explorer) = self.file_explorer else {
+            return;
+        };
+
+        // Center the explorer as an overlay, taking up most of the wizard area
+        let vertical_margin = 1;
+        let horizontal_margin = 2;
+        let overlay = Rect {
+            x: area.x + horizontal_margin,
+            y: area.y + vertical_margin,
+            width: area.width.saturating_sub(horizontal_margin * 2),
+            height: area.height.saturating_sub(vertical_margin * 2),
+        };
+
+        // Clear the area behind the overlay
+        frame.render_widget(Clear, overlay);
+        frame.render_widget_ref(explorer.widget(), overlay);
     }
 
     fn render_validation(&self, frame: &mut Frame, area: Rect) {
@@ -284,6 +341,10 @@ impl ProjectTypeHandler {
                 StepResult::Continue
             }
             KeyCode::Enter => {
+                // If on the browse button, open the file explorer
+                if field == self.browse_subfield() {
+                    return self.open_file_explorer();
+                }
                 if self.is_valid() {
                     match choice {
                         TypeChoice::New => {
@@ -303,11 +364,16 @@ impl ProjectTypeHandler {
                     StepResult::Continue
                 }
             }
+            KeyCode::Char(' ') if field == self.browse_subfield() => self.open_file_explorer(),
             KeyCode::Esc => {
                 self.focus = Focus::Choice;
                 StepResult::Continue
             }
             key => {
+                // Browse button doesn't accept text input — only Enter/Space activate it
+                if field == self.browse_subfield() {
+                    return StepResult::Continue;
+                }
                 let input = match choice {
                     TypeChoice::New => {
                         if field == 0 {
@@ -324,6 +390,67 @@ impl ProjectTypeHandler {
             }
         }
     }
+
+    fn open_file_explorer(&mut self) -> StepResult {
+        let mut explorer = match FileExplorer::new() {
+            Ok(e) => e,
+            Err(_) => return StepResult::Continue,
+        };
+
+        // Start in the location input's directory if it's valid
+        let start_dir = PathBuf::from(&self.location_input.value);
+        if start_dir.is_dir() {
+            let _ = explorer.set_cwd(&start_dir);
+        }
+
+        // Only show directories
+        explorer
+            .set_filter_map(|file| if file.is_dir { Some(file) } else { None })
+            .ok();
+
+        // Style the explorer with a border
+        let theme = ratatui_explorer::Theme::default()
+            .with_block(
+                Block::bordered()
+                    .title(" Browse ")
+                    .title_bottom(" Select <Space>  Cancel <Esc> "),
+            )
+            .with_highlight_symbol("▸ ");
+        explorer.set_theme(theme);
+
+        self.file_explorer = Some(explorer);
+        self.focus = Focus::Browsing;
+        StepResult::Continue
+    }
+
+    fn handle_browsing(&mut self, key: KeyEvent) -> StepResult {
+        let Some(ref mut explorer) = self.file_explorer else {
+            self.focus = Focus::SubField(self.browse_subfield());
+            return StepResult::Continue;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                // Close explorer without selecting
+                self.file_explorer = None;
+                self.focus = Focus::SubField(self.browse_subfield());
+            }
+            KeyCode::Char(' ') => {
+                // Space confirms: select the explorer's current working directory
+                let selected = explorer.cwd().to_string_lossy().to_string();
+                self.file_explorer = None;
+                self.focus = Focus::SubField(self.location_subfield());
+                self.location_input = TextInput::new("Location").with_value(selected);
+                self.validate();
+            }
+            _ => {
+                // All other keys (Enter, j/k/h/l, arrows, etc.) are passed to the explorer
+                let _ = explorer.handle(&Event::Key(key));
+            }
+        }
+
+        StepResult::Continue
+    }
 }
 
 impl StepHandler for ProjectTypeHandler {
@@ -337,12 +464,14 @@ impl StepHandler for ProjectTypeHandler {
         if self.expanded == Some(TypeChoice::New) {
             constraints.push(Constraint::Length(3)); // Name input
             constraints.push(Constraint::Length(3)); // Location input
+            constraints.push(Constraint::Length(1)); // Browse button
         }
         // "Existing" label
         constraints.push(Constraint::Length(1));
         // Existing's sub-field if expanded
         if self.expanded == Some(TypeChoice::Existing) {
             constraints.push(Constraint::Length(3)); // Location input
+            constraints.push(Constraint::Length(1)); // Browse button
         }
         // Spacer + validation message
         constraints.push(Constraint::Length(1));
@@ -375,6 +504,14 @@ impl StepHandler for ProjectTypeHandler {
             self.location_input
                 .render(frame, loc_area, matches!(self.focus, Focus::SubField(1)));
             idx += 1;
+
+            let browse_area = Rect {
+                x: areas[idx].x + indent,
+                width: areas[idx].width.saturating_sub(indent),
+                ..areas[idx]
+            };
+            self.render_browse_button(frame, browse_area, matches!(self.focus, Focus::SubField(2)));
+            idx += 1;
         }
 
         // Render "Existing" choice line
@@ -392,6 +529,14 @@ impl StepHandler for ProjectTypeHandler {
             self.location_input
                 .render(frame, loc_area, matches!(self.focus, Focus::SubField(0)));
             idx += 1;
+
+            let browse_area = Rect {
+                x: areas[idx].x + indent,
+                width: areas[idx].width.saturating_sub(indent),
+                ..areas[idx]
+            };
+            self.render_browse_button(frame, browse_area, matches!(self.focus, Focus::SubField(1)));
+            idx += 1;
         }
 
         // Skip spacer
@@ -399,12 +544,18 @@ impl StepHandler for ProjectTypeHandler {
 
         // Render validation message
         self.render_validation(frame, areas[idx]);
+
+        // Render file explorer overlay on top if browsing
+        if self.focus == Focus::Browsing {
+            self.render_file_explorer(frame, area);
+        }
     }
 
-    fn handle_input(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
+    fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
         match self.focus {
-            Focus::Choice => self.handle_choice(key),
-            Focus::SubField(n) => self.handle_subfield(key, n, config),
+            Focus::Choice => self.handle_choice(key.code),
+            Focus::SubField(n) => self.handle_subfield(key.code, n, config),
+            Focus::Browsing => self.handle_browsing(key),
         }
     }
 

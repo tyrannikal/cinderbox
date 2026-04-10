@@ -1,4 +1,4 @@
-use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
 use ratatui::{Frame, layout::Rect};
 
 use crate::ProjectConfig;
@@ -15,7 +15,7 @@ pub enum StepResult {
 
 pub trait StepHandler {
     fn render(&self, frame: &mut Frame, area: Rect);
-    fn handle_input(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult;
+    fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult;
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String>;
     fn execute(&self, config: &ProjectConfig) -> std::io::Result<()>;
 }
