@@ -4,26 +4,19 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Style, Stylize},
     text::Line,
     widgets::{Block, Clear, FrameExt, Paragraph},
 };
 use ratatui_explorer::FileExplorer;
+use strum::Display;
 
 use crate::ProjectConfig;
 use crate::widgets::text_input::TextInput;
 
-use super::{StepHandler, StepResult};
+use super::{CURSOR_MARKER, Focus, StepHandler, StepResult, render_choice_line};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-enum Focus {
-    #[default]
-    Choice,
-    SubField(usize),
-    Browsing,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Display)]
 enum TypeChoice {
     #[default]
     New,
@@ -31,15 +24,6 @@ enum TypeChoice {
 }
 
 const TYPE_CHOICES: [TypeChoice; 2] = [TypeChoice::New, TypeChoice::Existing];
-
-impl std::fmt::Display for TypeChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TypeChoice::New => write!(f, "New"),
-            TypeChoice::Existing => write!(f, "Existing"),
-        }
-    }
-}
 
 impl std::fmt::Debug for ProjectTypeHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -103,14 +87,11 @@ impl ProjectTypeHandler {
                 self.focus = Focus::SubField(0);
                 match choice {
                     TypeChoice::New => {
-                        self.name_input =
-                            TextInput::new("Project Name").with_value(&config.project_name);
-                        self.location_input =
-                            TextInput::new("Location").with_value(&config.project_location);
+                        self.name_input.set_value(&config.project_name);
+                        self.location_input.set_value(&config.project_location);
                     }
                     TypeChoice::Existing => {
-                        self.location_input =
-                            TextInput::new("Location").with_value(&config.project_location);
+                        self.location_input.set_value(&config.project_location);
                     }
                 }
                 self.validate();
@@ -206,19 +187,6 @@ impl ProjectTypeHandler {
             Some(TypeChoice::New) => 1,
             _ => 0,
         }
-    }
-
-    fn render_choice_line(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        choice: TypeChoice,
-        index: usize,
-    ) {
-        let is_highlighted = matches!(self.focus, Focus::Choice) && self.choice_cursor == index;
-        let marker = if is_highlighted { "▸ " } else { "  " };
-        let text = format!("{marker}{choice}");
-        frame.render_widget(Paragraph::new(text), area);
     }
 
     fn render_browse_button(&self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -413,9 +381,14 @@ impl ProjectTypeHandler {
             .with_block(
                 Block::bordered()
                     .title(" Browse ")
-                    .title_bottom(" Select <Space>  Cancel <Esc> "),
+                    .title_bottom(Line::from(vec![
+                        " Select ".into(),
+                        "<Space> ".blue().bold(),
+                        " Cancel ".into(),
+                        "<Esc> ".blue().bold(),
+                    ])),
             )
-            .with_highlight_symbol("▸ ");
+            .with_highlight_symbol(CURSOR_MARKER);
         explorer.set_theme(theme);
 
         self.file_explorer = Some(explorer);
@@ -481,7 +454,8 @@ impl StepHandler for ProjectTypeHandler {
         let mut idx = 0;
 
         // Render "New" choice line
-        self.render_choice_line(frame, areas[idx], TypeChoice::New, 0);
+        let highlighted = matches!(self.focus, Focus::Choice) && self.choice_cursor == 0;
+        render_choice_line(frame, areas[idx], &TypeChoice::New, highlighted);
         idx += 1;
 
         // Render New's sub-fields if expanded
@@ -515,7 +489,8 @@ impl StepHandler for ProjectTypeHandler {
         }
 
         // Render "Existing" choice line
-        self.render_choice_line(frame, areas[idx], TypeChoice::Existing, 1);
+        let highlighted = matches!(self.focus, Focus::Choice) && self.choice_cursor == 1;
+        render_choice_line(frame, areas[idx], &TypeChoice::Existing, highlighted);
         idx += 1;
 
         // Render Existing's sub-field if expanded
@@ -590,5 +565,407 @@ impl StepHandler for ProjectTypeHandler {
             std::fs::create_dir_all(&path)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // --- Default state ---
+
+    #[test]
+    fn default_state() {
+        let h = ProjectTypeHandler::default();
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+        assert_eq!(h.choice_cursor, 0);
+        assert!(!h.in_details());
+        assert!(!h.is_expanded());
+    }
+
+    // --- Choice navigation ---
+
+    #[test]
+    fn choice_navigation_down_up() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Down), &mut c);
+        assert_eq!(h.choice_cursor, 1);
+        h.handle_input(key(KeyCode::Down), &mut c);
+        assert_eq!(h.choice_cursor, 1); // clamped at max
+        h.handle_input(key(KeyCode::Up), &mut c);
+        assert_eq!(h.choice_cursor, 0);
+        h.handle_input(key(KeyCode::Up), &mut c);
+        assert_eq!(h.choice_cursor, 0); // clamped at 0
+    }
+
+    // --- Expanding choices ---
+
+    #[test]
+    fn enter_expands_new() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.expanded, Some(TypeChoice::New));
+        assert_eq!(h.focus, Focus::SubField(0));
+        assert!(h.in_details());
+        assert!(h.is_expanded());
+    }
+
+    #[test]
+    fn enter_expands_existing() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.choice_cursor = 1;
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.expanded, Some(TypeChoice::Existing));
+        assert_eq!(h.focus, Focus::SubField(0));
+    }
+
+    // --- max_subfield ---
+
+    #[test]
+    fn max_subfield_new_is_2() {
+        let h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            ..Default::default()
+        };
+        assert_eq!(h.max_subfield(), 2);
+    }
+
+    #[test]
+    fn max_subfield_existing_is_1() {
+        let h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            ..Default::default()
+        };
+        assert_eq!(h.max_subfield(), 1);
+    }
+
+    // --- Esc from subfield returns to choice ---
+
+    #[test]
+    fn esc_returns_to_choice() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.focus, Focus::SubField(0));
+        h.handle_input(key(KeyCode::Esc), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+    }
+
+    // --- Left collapses expanded, then goes back ---
+
+    #[test]
+    fn left_collapses_then_backs() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        // Expand
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        h.focus = Focus::Choice; // simulate being back at choice level
+        let result = h.handle_input(key(KeyCode::Left), &mut c);
+        assert!(h.expanded.is_none());
+        assert!(matches!(result, StepResult::Continue));
+        let result = h.handle_input(key(KeyCode::Left), &mut c);
+        assert!(matches!(result, StepResult::Back));
+    }
+
+    // --- Quit ---
+
+    #[test]
+    fn q_quits() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Char('q')), &mut c);
+        assert!(matches!(result, StepResult::Quit));
+    }
+
+    // --- Tab cycling in New (3 subfields: name, location, browse) ---
+
+    #[test]
+    fn tab_cycles_new_subfields() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand New
+        assert_eq!(h.focus, Focus::SubField(0));
+        h.handle_input(key(KeyCode::Tab), &mut c);
+        assert_eq!(h.focus, Focus::SubField(1));
+        h.handle_input(key(KeyCode::Tab), &mut c);
+        assert_eq!(h.focus, Focus::SubField(2));
+        h.handle_input(key(KeyCode::Tab), &mut c);
+        assert_eq!(h.focus, Focus::SubField(0)); // wraps
+    }
+
+    #[test]
+    fn backtab_cycles_new_subfields() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.focus, Focus::SubField(0));
+        h.handle_input(key(KeyCode::BackTab), &mut c);
+        assert_eq!(h.focus, Focus::SubField(2)); // wraps to browse
+    }
+
+    // --- Text input forwarding ---
+
+    #[test]
+    fn typing_in_name_subfield() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand New, focus name
+        h.handle_input(key(KeyCode::Char('a')), &mut c);
+        h.handle_input(key(KeyCode::Char('b')), &mut c);
+        assert_eq!(h.name_input.value, "ab");
+    }
+
+    #[test]
+    fn typing_in_location_subfield_new() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        h.handle_input(key(KeyCode::Tab), &mut c); // move to location
+        // Clear existing location value first
+        h.location_input = TextInput::new("Location");
+        h.handle_input(key(KeyCode::Char('/')), &mut c);
+        assert!(h.location_input.value.contains('/'));
+    }
+
+    // --- planned_actions ---
+
+    #[test]
+    fn planned_actions_new_project() {
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig {
+            project_type: Some(crate::ProjectType::New),
+            project_name: "myapp".to_string(),
+            project_location: "/home/user".to_string(),
+            ..Default::default()
+        };
+        let actions = h.planned_actions(&c);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].contains("/home/user/myapp"));
+    }
+
+    #[test]
+    fn planned_actions_existing_project() {
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig {
+            project_type: Some(crate::ProjectType::Existing),
+            project_location: "/home/user/existing".to_string(),
+            ..Default::default()
+        };
+        let actions = h.planned_actions(&c);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].contains("/home/user/existing"));
+    }
+
+    #[test]
+    fn planned_actions_empty_name() {
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig {
+            project_type: Some(crate::ProjectType::New),
+            project_name: String::new(),
+            ..Default::default()
+        };
+        assert!(h.planned_actions(&c).is_empty());
+    }
+
+    #[test]
+    fn planned_actions_none() {
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig::default();
+        assert!(h.planned_actions(&c).is_empty());
+    }
+
+    // --- Validation (New project) ---
+
+    #[test]
+    fn validate_new_requires_name() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            name_input: TextInput::new("Name"),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("required"));
+    }
+
+    #[test]
+    fn validate_new_warns_missing_parent() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            name_input: TextInput::new("Name").with_value("proj"),
+            location_input: TextInput::new("Location").with_value("/nonexistent_xyz_path_42"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("Warning"));
+    }
+
+    #[test]
+    fn validate_new_shows_will_create() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            name_input: TextInput::new("Name").with_value("new_test_project_xyz"),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("Will create"));
+    }
+
+    // --- Validation (Existing project) ---
+
+    #[test]
+    fn validate_existing_requires_location() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            location_input: TextInput::new("Location"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("required"));
+    }
+
+    #[test]
+    fn validate_existing_warns_nonexistent() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            location_input: TextInput::new("Location").with_value("/nonexistent_xyz_path_42"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("Warning"));
+    }
+
+    #[test]
+    fn validate_existing_shows_will_use() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains("Will use"));
+    }
+
+    // --- is_valid ---
+
+    #[test]
+    fn is_valid_false_when_no_expansion() {
+        let h = ProjectTypeHandler::default();
+        assert!(!h.is_valid());
+    }
+
+    #[test]
+    fn is_valid_new_with_valid_path() {
+        let h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            name_input: TextInput::new("Name").with_value("unique_test_proj_abc"),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        assert!(h.is_valid());
+    }
+
+    #[test]
+    fn is_valid_existing_with_real_path() {
+        let h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        assert!(h.is_valid());
+    }
+
+    // --- derived_name ---
+
+    #[test]
+    fn derived_name_from_path() {
+        let h = ProjectTypeHandler {
+            location_input: TextInput::new("Location").with_value("/home/user/myproject"),
+            ..Default::default()
+        };
+        assert_eq!(h.derived_name(), "myproject");
+    }
+
+    // --- Enter on valid New commits to config ---
+
+    #[test]
+    fn enter_commits_valid_new_project() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand New
+        h.name_input = TextInput::new("Name").with_value("unique_test_proj_def");
+        h.location_input = TextInput::new("Location").with_value("/tmp");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.project_type, Some(crate::ProjectType::New));
+        assert_eq!(c.project_name, "unique_test_proj_def");
+        assert_eq!(c.project_location, "/tmp");
+    }
+
+    #[test]
+    fn enter_commits_valid_existing_project() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.choice_cursor = 1;
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Existing
+        h.location_input = TextInput::new("Location").with_value("/tmp");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.project_type, Some(crate::ProjectType::Existing));
+        assert_eq!(c.project_name, "tmp");
+        assert_eq!(c.project_location, "/tmp");
+    }
+
+    // --- Enter on invalid stays ---
+
+    #[test]
+    fn enter_on_invalid_continues() {
+        let mut h = ProjectTypeHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand New
+        h.name_input = TextInput::new("Name"); // empty name = invalid
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+    }
+
+    // --- execute creates directory for New ---
+
+    #[test]
+    fn execute_creates_dir_for_new() {
+        let dir = std::env::temp_dir().join("cinderbox_test_execute_new");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig {
+            project_type: Some(crate::ProjectType::New),
+            project_name: "subdir".to_string(),
+            project_location: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        h.execute(&c).unwrap();
+        assert!(dir.join("subdir").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn execute_noop_for_existing() {
+        let h = ProjectTypeHandler::default();
+        let c = ProjectConfig {
+            project_type: Some(crate::ProjectType::Existing),
+            project_location: "/tmp".to_string(),
+            ..Default::default()
+        };
+        assert!(h.execute(&c).is_ok());
     }
 }

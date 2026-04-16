@@ -13,7 +13,10 @@ use ratatui::{
 mod steps;
 mod widgets;
 
-use steps::{StepHandler, StepResult, project_type::ProjectTypeHandler, vcs::VcsHandler};
+use steps::{
+    CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, project_type::ProjectTypeHandler,
+    vcs::VcsHandler,
+};
 
 fn main() -> io::Result<()> {
     let mut app = App::default();
@@ -246,7 +249,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let marker = if i == self.cursor { "▸ " } else { "  " };
+                let marker = if i == self.cursor { CURSOR_MARKER } else { CURSOR_BLANK };
                 format!("{marker}{v}")
             })
             .collect::<Vec<_>>()
@@ -262,7 +265,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                let cursor = if i == self.cursor { "▸ " } else { "  " };
+                let cursor = if i == self.cursor { CURSOR_MARKER } else { CURSOR_BLANK };
                 let check = if selected.contains(v) { "[x]" } else { "[ ]" };
                 format!("{cursor}{check} {v}")
             })
@@ -453,6 +456,7 @@ impl App {
     }
 
     fn current_step(&self) -> &WizardStep {
+        debug_assert!(self.step_index < WizardStep::VARIANTS.len());
         &WizardStep::VARIANTS[self.step_index]
     }
 
@@ -487,6 +491,10 @@ impl App {
     }
 
     fn select(&mut self) {
+        debug_assert!(
+            self.cursor < self.current_step().option_count()
+                || matches!(self.current_step(), WizardStep::Summary)
+        );
         match self.current_step() {
             WizardStep::ProjectType | WizardStep::Vcs => {} // handled by their handlers
             WizardStep::Languages => {
@@ -568,5 +576,324 @@ impl App {
             self.restore_cursor();
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ProjectConfig defaults ---
+
+    #[test]
+    fn project_config_defaults_are_none_or_empty() {
+        let c = ProjectConfig::default();
+        assert!(c.project_type.is_none());
+        assert!(c.project_name.is_empty());
+        assert!(c.project_location.is_empty());
+        assert!(c.vcs.is_none());
+        assert!(c.default_branch.is_empty());
+        assert!(!c.jj_colocate);
+        assert!(c.languages.is_empty());
+        assert!(c.database.is_none());
+        assert!(c.remotes.is_empty());
+        assert!(c.extras.is_empty());
+    }
+
+    #[test]
+    fn project_config_fields_are_independent() {
+        let mut c = ProjectConfig {
+            project_type: Some(ProjectType::New),
+            project_name: "test".to_string(),
+            ..Default::default()
+        };
+        assert!(c.vcs.is_none());
+        assert!(c.languages.is_empty());
+
+        c.vcs = Some(Vcs::Git);
+        c.default_branch = "develop".to_string();
+        assert_eq!(c.project_name, "test");
+        assert!(c.database.is_none());
+    }
+
+    // --- Enum Display (strum) ---
+
+    #[test]
+    fn project_type_display() {
+        assert_eq!(ProjectType::New.to_string(), "New");
+        assert_eq!(ProjectType::Existing.to_string(), "Existing");
+    }
+
+    #[test]
+    fn vcs_display() {
+        assert_eq!(Vcs::Git.to_string(), "Git");
+        assert_eq!(Vcs::Jujutsu.to_string(), "Jujutsu (jj)");
+        assert_eq!(Vcs::None.to_string(), "None");
+    }
+
+    #[test]
+    fn language_display_special_cases() {
+        assert_eq!(Language::CSharp.to_string(), "C#");
+        assert_eq!(Language::Cpp.to_string(), "C/C++");
+        assert_eq!(Language::Rust.to_string(), "Rust");
+    }
+
+    #[test]
+    fn extra_display() {
+        assert_eq!(Extra::Gitignore.to_string(), ".gitignore");
+        assert_eq!(Extra::Readme.to_string(), "README");
+        assert_eq!(Extra::License.to_string(), "LICENSE");
+    }
+
+    // --- WizardStep option_count ---
+
+    #[test]
+    fn wizard_step_option_counts() {
+        assert_eq!(WizardStep::ProjectType.option_count(), ProjectType::VARIANTS.len());
+        assert_eq!(WizardStep::Vcs.option_count(), Vcs::VARIANTS.len());
+        assert_eq!(WizardStep::Languages.option_count(), Language::VARIANTS.len());
+        assert_eq!(WizardStep::Database.option_count(), Database::VARIANTS.len());
+        assert_eq!(WizardStep::Remotes.option_count(), Remote::VARIANTS.len());
+        assert_eq!(WizardStep::Extras.option_count(), Extra::VARIANTS.len());
+        assert_eq!(WizardStep::Summary.option_count(), 0);
+    }
+
+    // --- App step navigation ---
+
+    #[test]
+    fn app_starts_at_step_zero() {
+        let app = App::default();
+        assert_eq!(app.step_index, 0);
+        assert!(matches!(app.current_step(), WizardStep::ProjectType));
+    }
+
+    #[test]
+    fn next_advances_step() {
+        let mut app = App::default();
+        app.next();
+        assert_eq!(app.step_index, 1);
+        assert!(matches!(app.current_step(), WizardStep::Vcs));
+    }
+
+    #[test]
+    fn next_clamps_at_last_step() {
+        let mut app = App::default();
+        for _ in 0..100 {
+            app.next();
+        }
+        assert_eq!(app.step_index, WizardStep::VARIANTS.len() - 1);
+        assert!(matches!(app.current_step(), WizardStep::Summary));
+    }
+
+    #[test]
+    fn prev_clamps_at_zero() {
+        let mut app = App::default();
+        app.prev();
+        assert_eq!(app.step_index, 0);
+    }
+
+    #[test]
+    fn prev_goes_back() {
+        let mut app = App::default();
+        app.next();
+        app.next();
+        assert_eq!(app.step_index, 2);
+        app.prev();
+        assert_eq!(app.step_index, 1);
+    }
+
+    // --- Cursor movement ---
+
+    #[test]
+    fn cursor_down_respects_option_count() {
+        let mut app = App {
+            step_index: 2, // Languages
+            cursor: 0,
+            ..Default::default()
+        };
+        let count = app.current_step().option_count();
+        for _ in 0..count + 5 {
+            app.cursor_down();
+        }
+        assert_eq!(app.cursor, count - 1);
+    }
+
+    #[test]
+    fn cursor_up_clamps_at_zero() {
+        let mut app = App {
+            step_index: 2,
+            cursor: 2,
+            ..Default::default()
+        };
+        app.cursor_up();
+        assert_eq!(app.cursor, 1);
+        app.cursor_up();
+        assert_eq!(app.cursor, 0);
+        app.cursor_up();
+        assert_eq!(app.cursor, 0);
+    }
+
+    // --- Multi-select toggling ---
+
+    #[test]
+    fn language_toggle_on_and_off() {
+        let mut app = App {
+            step_index: 2, // Languages
+            cursor: 0,     // Rust
+            ..Default::default()
+        };
+        app.select();
+        assert_eq!(app.selected_languages.len(), 1);
+        assert_eq!(app.selected_languages[0], Language::Rust);
+        app.select();
+        assert!(app.selected_languages.is_empty());
+    }
+
+    #[test]
+    fn multiple_languages_can_be_selected() {
+        let mut app = App {
+            step_index: 2,
+            cursor: 0, // Rust
+            ..Default::default()
+        };
+        app.select();
+        app.cursor = 2; // Python
+        app.select();
+        assert_eq!(app.selected_languages.len(), 2);
+        assert!(app.selected_languages.contains(&Language::Rust));
+        assert!(app.selected_languages.contains(&Language::Python));
+    }
+
+    // --- Database single-select ---
+
+    #[test]
+    fn database_select_commits_and_advances() {
+        let mut app = App {
+            step_index: 3, // Database
+            cursor: 0,     // PostgreSQL
+            ..Default::default()
+        };
+        let old_step = app.step_index;
+        app.select();
+        assert_eq!(app.config.database, Some(Database::PostgreSQL));
+        assert_eq!(app.step_index, old_step + 1);
+    }
+
+    // --- Summary confirm ---
+
+    #[test]
+    fn summary_select_confirms() {
+        let mut app = App {
+            step_index: WizardStep::VARIANTS.len() - 1, // Summary
+            ..Default::default()
+        };
+        assert!(!app.confirmed);
+        app.select();
+        assert!(app.confirmed);
+        assert!(app.exit);
+    }
+
+    // --- select_or_next for multi-selects ---
+
+    #[test]
+    fn select_or_next_commits_languages() {
+        let mut app = App {
+            step_index: 2, // Languages
+            selected_languages: vec![Language::Rust, Language::Go],
+            ..Default::default()
+        };
+        app.select_or_next();
+        assert_eq!(app.config.languages, vec![Language::Rust, Language::Go]);
+        assert_eq!(app.step_index, 3);
+    }
+
+    // --- Config summary formatting ---
+
+    #[test]
+    fn config_summary_shows_dash_for_unset() {
+        let app = App::default();
+        let summary = app.config_summary();
+        assert!(summary.contains("Project Type: —"));
+        assert!(summary.contains("Name: —"));
+        assert!(summary.contains("VCS: —"));
+    }
+
+    #[test]
+    fn config_summary_shows_set_values() {
+        let mut app = App::default();
+        app.config.project_type = Some(ProjectType::New);
+        app.config.project_name = "myproj".to_string();
+        app.config.project_location = "/tmp".to_string();
+        app.config.vcs = Some(Vcs::Git);
+        app.config.default_branch = "main".to_string();
+        let summary = app.config_summary();
+        assert!(summary.contains("Project Type: New"));
+        assert!(summary.contains("Name: myproj"));
+        assert!(summary.contains("Location: /tmp"));
+        assert!(summary.contains("VCS: Git"));
+        assert!(summary.contains("Default branch: main"));
+    }
+
+    #[test]
+    fn config_summary_jj_colocated_shows_mode() {
+        let mut app = App::default();
+        app.config.vcs = Some(Vcs::Jujutsu);
+        app.config.jj_colocate = true;
+        app.config.default_branch = "trunk".to_string();
+        let summary = app.config_summary();
+        assert!(summary.contains("Colocated with git"));
+        assert!(summary.contains("Default branch: trunk"));
+    }
+
+    #[test]
+    fn config_summary_jj_native_hides_branch() {
+        let mut app = App::default();
+        app.config.vcs = Some(Vcs::Jujutsu);
+        app.config.jj_colocate = false;
+        app.config.default_branch = "trunk".to_string();
+        let summary = app.config_summary();
+        assert!(summary.contains("Mode: Native"));
+        assert!(!summary.contains("Default branch:"));
+    }
+
+    // --- format_config_list ---
+
+    #[test]
+    fn format_config_list_empty() {
+        let empty: Vec<Language> = vec![];
+        assert_eq!(App::format_config_list("Languages", &empty, "—"), "Languages: —");
+    }
+
+    #[test]
+    fn format_config_list_multiple() {
+        let items = vec![Language::Rust, Language::Go];
+        assert_eq!(App::format_config_list("Languages", &items, "—"), "Languages: Rust, Go");
+    }
+
+    // --- render_select_list / render_multi_select_list ---
+
+    #[test]
+    fn render_select_list_highlights_cursor() {
+        let app = App {
+            cursor: 1,
+            ..Default::default()
+        };
+        let output = app.render_select_list(&["Alpha", "Beta", "Gamma"]);
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].starts_with(CURSOR_BLANK));
+        assert!(lines[1].starts_with(CURSOR_MARKER));
+        assert!(lines[2].starts_with(CURSOR_BLANK));
+    }
+
+    #[test]
+    fn render_multi_select_list_shows_checks() {
+        let app = App {
+            cursor: 0,
+            ..Default::default()
+        };
+        let variants = [Language::Rust, Language::Go];
+        let selected = [Language::Go];
+        let output = app.render_multi_select_list(&variants, &selected);
+        assert!(output.contains("[x] Go"));
+        assert!(output.contains("[ ] Rust"));
+    }
 }

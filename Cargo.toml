@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 repository = "https://codeberg.org/tyrannikal/cinderbox"
 
 [dependencies]
-color-eyre = "0.6.5"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm", "unstable-widget-ref"] }
 ratatui-explorer = "0.3.0"
