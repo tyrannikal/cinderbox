@@ -297,7 +297,9 @@ impl ProjectTypeHandler {
         field: usize,
         config: &mut ProjectConfig,
     ) -> StepResult {
-        let choice = self.expanded.unwrap(); // safe: SubField only reachable when expanded
+        let choice = self
+            .expanded
+            .expect("SubField focus implies expanded is Some");
 
         match key {
             KeyCode::Up => {

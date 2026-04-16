@@ -162,7 +162,9 @@ impl VcsHandler {
         field: usize,
         config: &mut ProjectConfig,
     ) -> StepResult {
-        let choice = self.expanded.unwrap(); // safe: SubField only reachable when expanded
+        let choice = self
+            .expanded
+            .expect("SubField focus implies expanded is Some");
 
         // Common navigation keys (apply to any sub-field)
         match key {
