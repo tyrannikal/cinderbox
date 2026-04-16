@@ -308,6 +308,10 @@ impl ProjectTypeHandler {
                 }
                 StepResult::Continue
             }
+            KeyCode::Left if field == self.browse_subfield() => {
+                self.focus = Focus::SubField(self.location_subfield());
+                StepResult::Continue
+            }
             KeyCode::Down => {
                 if field < self.max_subfield() {
                     self.focus = Focus::SubField(field + 1);
@@ -681,6 +685,32 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(h.max_subfield(), 1);
+    }
+
+    // --- Left on browse button moves to location input ---
+
+    #[test]
+    fn left_on_browse_moves_to_location_new() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            focus: Focus::SubField(2),
+            ..Default::default()
+        };
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Left), &mut c);
+        assert_eq!(h.focus, Focus::SubField(1));
+    }
+
+    #[test]
+    fn left_on_browse_moves_to_location_existing() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::Existing),
+            focus: Focus::SubField(1),
+            ..Default::default()
+        };
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Left), &mut c);
+        assert_eq!(h.focus, Focus::SubField(0));
     }
 
     // --- Esc from subfield returns to choice ---
