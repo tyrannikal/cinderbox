@@ -242,6 +242,11 @@ impl App {
         let config_text = self.config_summary();
         let config = Paragraph::new(config_text).block(config_block);
         frame.render_widget(config, config_area);
+
+        // Overlays render last so they can dim everything that came before.
+        if self.step_index == 0 && self.project_type_handler.is_browsing() {
+            self.project_type_handler.render_overlay(frame, wizard_area);
+        }
     }
 
     fn render_select_list<T: std::fmt::Display>(&self, variants: &[T]) -> String {

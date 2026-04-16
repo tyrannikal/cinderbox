@@ -4,7 +4,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize},
+    style::{Color, Modifier, Style, Stylize},
     text::Line,
     widgets::{Block, Clear, FrameExt, Paragraph},
 };
@@ -190,30 +190,56 @@ impl ProjectTypeHandler {
     }
 
     fn render_browse_button(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let style = if focused {
+        let block_style = if focused {
+            Style::default().white()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::bordered().style(block_style);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let label_style = if focused {
             Style::default().fg(Color::Black).bg(Color::White)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        frame.render_widget(Paragraph::new(Line::from("[ Browse ]").style(style)), area);
+        frame.render_widget(
+            Paragraph::new(Line::from("Browse").style(label_style)).centered(),
+            inner,
+        );
     }
 
-    fn render_file_explorer(&self, frame: &mut Frame, area: Rect) {
+    pub fn is_browsing(&self) -> bool {
+        matches!(self.focus, Focus::Browsing)
+    }
+
+    pub fn render_overlay(&self, frame: &mut Frame, wizard_area: Rect) {
         let Some(ref explorer) = self.file_explorer else {
             return;
         };
 
-        // Center the explorer as an overlay, taking up most of the wizard area
+        // Dim the full terminal so the explorer overlay visually pops. Dark-gray fg on
+        // a black bg forces a strong visible mute even on terminals where Modifier::DIM
+        // is a no-op. Clear + explorer below overwrite the overlay cells.
+        let full = frame.area();
+        frame.buffer_mut().set_style(
+            full,
+            Style::default()
+                .fg(Color::Rgb(60, 60, 60))
+                .bg(Color::Black)
+                .add_modifier(Modifier::DIM),
+        );
+
         let vertical_margin = 1;
         let horizontal_margin = 2;
         let overlay = Rect {
-            x: area.x + horizontal_margin,
-            y: area.y + vertical_margin,
-            width: area.width.saturating_sub(horizontal_margin * 2),
-            height: area.height.saturating_sub(vertical_margin * 2),
+            x: wizard_area.x + horizontal_margin,
+            y: wizard_area.y + vertical_margin,
+            width: wizard_area.width.saturating_sub(horizontal_margin * 2),
+            height: wizard_area.height.saturating_sub(vertical_margin * 2),
         };
 
-        // Clear the area behind the overlay
         frame.render_widget(Clear, overlay);
         frame.render_widget_ref(explorer.widget(), overlay);
     }
@@ -383,7 +409,9 @@ impl ProjectTypeHandler {
                     .title(" Browse ")
                     .title_bottom(Line::from(vec![
                         " Select ".into(),
-                        "<Space> ".blue().bold(),
+                        "<Enter> ".blue().bold(),
+                        " Navigation ".into(),
+                        "<↑/↓/←/→> ".blue().bold(),
                         " Cancel ".into(),
                         "<Esc> ".blue().bold(),
                     ])),
@@ -408,16 +436,29 @@ impl ProjectTypeHandler {
                 self.file_explorer = None;
                 self.focus = Focus::SubField(self.browse_subfield());
             }
+            KeyCode::Enter => {
+                // Enter on "../" navigates to the parent; on any other entry, selects it.
+                let current = explorer.current();
+                let is_parent_entry = current.name == "../";
+                let selected = current.path.to_string_lossy().to_string();
+
+                if is_parent_entry {
+                    let right = KeyEvent::new(KeyCode::Right, key.modifiers);
+                    let _ = explorer.handle(&Event::Key(right));
+                } else {
+                    self.file_explorer = None;
+                    self.focus = Focus::SubField(self.location_subfield());
+                    self.location_input = TextInput::new("Location").with_value(selected);
+                    self.validate();
+                }
+            }
             KeyCode::Char(' ') => {
-                // Space confirms: select the explorer's current working directory
-                let selected = explorer.cwd().to_string_lossy().to_string();
-                self.file_explorer = None;
-                self.focus = Focus::SubField(self.location_subfield());
-                self.location_input = TextInput::new("Location").with_value(selected);
-                self.validate();
+                // Space descends into the highlighted directory, same as Right arrow
+                let right = KeyEvent::new(KeyCode::Right, key.modifiers);
+                let _ = explorer.handle(&Event::Key(right));
             }
             _ => {
-                // All other keys (Enter, j/k/h/l, arrows, etc.) are passed to the explorer
+                // All other keys (j/k/h/l, arrows, etc.) are passed to the explorer
                 let _ = explorer.handle(&Event::Key(key));
             }
         }
@@ -436,15 +477,13 @@ impl StepHandler for ProjectTypeHandler {
         // New's sub-fields if expanded
         if self.expanded == Some(TypeChoice::New) {
             constraints.push(Constraint::Length(3)); // Name input
-            constraints.push(Constraint::Length(3)); // Location input
-            constraints.push(Constraint::Length(1)); // Browse button
+            constraints.push(Constraint::Length(3)); // Location input + browse button row
         }
         // "Existing" label
         constraints.push(Constraint::Length(1));
         // Existing's sub-field if expanded
         if self.expanded == Some(TypeChoice::Existing) {
-            constraints.push(Constraint::Length(3)); // Location input
-            constraints.push(Constraint::Length(1)); // Browse button
+            constraints.push(Constraint::Length(3)); // Location input + browse button row
         }
         // Spacer + validation message
         constraints.push(Constraint::Length(1));
@@ -470,21 +509,20 @@ impl StepHandler for ProjectTypeHandler {
                 .render(frame, name_area, matches!(self.focus, Focus::SubField(0)));
             idx += 1;
 
-            let loc_area = Rect {
+            let row = Rect {
                 x: areas[idx].x + indent,
                 width: areas[idx].width.saturating_sub(indent),
                 ..areas[idx]
             };
+            let cols = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(12),
+            ])
+            .split(row);
             self.location_input
-                .render(frame, loc_area, matches!(self.focus, Focus::SubField(1)));
-            idx += 1;
-
-            let browse_area = Rect {
-                x: areas[idx].x + indent,
-                width: areas[idx].width.saturating_sub(indent),
-                ..areas[idx]
-            };
-            self.render_browse_button(frame, browse_area, matches!(self.focus, Focus::SubField(2)));
+                .render(frame, cols[0], matches!(self.focus, Focus::SubField(1)));
+            self.render_browse_button(frame, cols[2], matches!(self.focus, Focus::SubField(2)));
             idx += 1;
         }
 
@@ -496,21 +534,20 @@ impl StepHandler for ProjectTypeHandler {
         // Render Existing's sub-field if expanded
         if self.expanded == Some(TypeChoice::Existing) {
             let indent = 4u16;
-            let loc_area = Rect {
+            let row = Rect {
                 x: areas[idx].x + indent,
                 width: areas[idx].width.saturating_sub(indent),
                 ..areas[idx]
             };
+            let cols = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(12),
+            ])
+            .split(row);
             self.location_input
-                .render(frame, loc_area, matches!(self.focus, Focus::SubField(0)));
-            idx += 1;
-
-            let browse_area = Rect {
-                x: areas[idx].x + indent,
-                width: areas[idx].width.saturating_sub(indent),
-                ..areas[idx]
-            };
-            self.render_browse_button(frame, browse_area, matches!(self.focus, Focus::SubField(1)));
+                .render(frame, cols[0], matches!(self.focus, Focus::SubField(0)));
+            self.render_browse_button(frame, cols[2], matches!(self.focus, Focus::SubField(1)));
             idx += 1;
         }
 
@@ -520,10 +557,8 @@ impl StepHandler for ProjectTypeHandler {
         // Render validation message
         self.render_validation(frame, areas[idx]);
 
-        // Render file explorer overlay on top if browsing
-        if self.focus == Focus::Browsing {
-            self.render_file_explorer(frame, area);
-        }
+        // Overlay (file explorer) is rendered by App::draw() AFTER the config panel,
+        // so the dim effect covers the full terminal including the config area.
     }
 
     fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
