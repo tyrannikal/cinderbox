@@ -10,12 +10,13 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
+mod registry;
 mod steps;
 mod widgets;
 
 use steps::{
-    CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, project_type::ProjectTypeHandler,
-    vcs::VcsHandler,
+    CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, languages::LanguagesHandler,
+    project_type::ProjectTypeHandler, vcs::VcsHandler, workflows::WorkflowsHandler,
 };
 
 fn main() -> io::Result<()> {
@@ -35,10 +36,55 @@ pub struct ProjectConfig {
     vcs: Option<Vcs>,
     default_branch: String,
     jj_colocate: bool,
-    languages: Vec<Language>,
+    language_configs: Vec<LanguageConfig>,
+    workflows: WorkflowConfig,
     database: Option<Database>,
     remotes: Vec<Remote>,
     extras: Vec<Extra>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LanguageConfig {
+    pub(crate) language: Language,
+    pub(crate) tools: Vec<&'static str>,
+    pub(crate) common_deps: Vec<&'static str>,
+    pub(crate) custom_deps: String,
+}
+
+impl LanguageConfig {
+    pub(crate) fn new(language: Language) -> Self {
+        Self {
+            language,
+            tools: Vec::new(),
+            common_deps: Vec::new(),
+            custom_deps: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WorkflowConfig {
+    pub(crate) ci: Option<CiProvider>,
+    pub(crate) pre_commit: Option<PreCommitFramework>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+pub enum CiProvider {
+    None,
+    #[strum(to_string = "GitHub Actions")]
+    GitHubActions,
+    #[strum(to_string = "GitLab CI")]
+    GitLab,
+    Woodpecker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+pub enum PreCommitFramework {
+    #[strum(to_string = "pre-commit")]
+    PreCommit,
+    #[strum(to_string = "lefthook")]
+    Lefthook,
+    None,
 }
 
 #[derive(Debug, Default, VariantArray, Display)]
@@ -49,6 +95,7 @@ enum WizardStep {
     #[strum(to_string = "Version Control System")]
     Vcs,
     Languages,
+    Workflows,
     Database,
     Remotes,
     Extras,
@@ -61,6 +108,7 @@ impl WizardStep {
             Self::ProjectType => ProjectType::VARIANTS.len(),
             Self::Vcs => Vcs::VARIANTS.len(),
             Self::Languages => Language::VARIANTS.len(),
+            Self::Workflows => 0,
             Self::Database => Database::VARIANTS.len(),
             Self::Remotes => Remote::VARIANTS.len(),
             Self::Extras => Extra::VARIANTS.len(),
@@ -135,13 +183,14 @@ struct App {
     step_index: usize,
     cursor: usize,
     config: ProjectConfig,
-    selected_languages: Vec<Language>,
     selected_remotes: Vec<Remote>,
     selected_extras: Vec<Extra>,
     confirmed: bool,
     exit: bool,
     project_type_handler: ProjectTypeHandler,
     vcs_handler: VcsHandler,
+    languages_handler: LanguagesHandler,
+    workflows_handler: WorkflowsHandler,
 }
 
 impl App {
@@ -154,6 +203,8 @@ impl App {
         if self.confirmed {
             self.project_type_handler.execute(&self.config)?;
             self.vcs_handler.execute(&self.config)?;
+            self.languages_handler.execute(&self.config)?;
+            self.workflows_handler.execute(&self.config)?;
         }
         Ok(())
     }
@@ -166,14 +217,13 @@ impl App {
         // Wizard panel (left 2/3)
         let title = Line::from(format!(" cinderbox — {} ", self.current_step())).bold();
         let mut instruction_spans = vec![];
-        let pt_in_details = self.step_index == 0 && self.project_type_handler.in_details();
-        let pt_expanded = self.step_index == 0 && self.project_type_handler.is_expanded();
-        let vcs_in_details = self.step_index == 1 && self.vcs_handler.in_details();
-        let vcs_expanded = self.step_index == 1 && self.vcs_handler.is_expanded();
-        if pt_in_details || vcs_in_details {
+        let handler = self.current_handler();
+        let in_details = handler.is_some_and(|h| h.in_details());
+        let is_expanded = handler.is_some_and(|h| h.is_expanded());
+        if in_details {
             instruction_spans.push(" Back ".into());
             instruction_spans.push("<Esc> ".blue().bold());
-        } else if pt_expanded || vcs_expanded {
+        } else if is_expanded {
             instruction_spans.push(" Collapse ".into());
             instruction_spans.push("<←/H> ".blue().bold());
         } else if self.step_index > 0 {
@@ -181,24 +231,27 @@ impl App {
             instruction_spans.push("<←/H> ".blue().bold());
         }
         match self.current_step() {
-            WizardStep::Languages | WizardStep::Remotes | WizardStep::Extras => {
+            WizardStep::Remotes | WizardStep::Extras => {
                 instruction_spans.push(" Toggle ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
                 instruction_spans.push(" Confirm ".into());
+                instruction_spans.push("<→/L> ".blue().bold());
+            }
+            // Languages at Choice focus: Right/l expands (not confirm). At SubField
+            // focus it falls through to the generic "Next <Enter>" arm below.
+            WizardStep::Languages if !in_details => {
+                instruction_spans.push(" Toggle ".into());
+                instruction_spans.push("<Enter> ".blue().bold());
+                instruction_spans.push(" Expand ".into());
                 instruction_spans.push("<→/L> ".blue().bold());
             }
             WizardStep::Summary => {
                 instruction_spans.push(" Confirm ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
             }
-            WizardStep::ProjectType if self.project_type_handler.in_details() => {
-                // SubField focus: only Enter advances; →/L are captured by the text input.
-                instruction_spans.push(" Next ".into());
-                instruction_spans.push("<Enter> ".blue().bold());
-            }
-            WizardStep::Vcs if self.vcs_handler.in_details() => {
-                // SubField focus: only Enter advances; →/L are captured by the
-                // colocate radio toggle or the default-branch text input.
+            _ if in_details => {
+                // SubField focus: only Enter advances; →/L are captured by the focused
+                // sub-field (text input cursor, colocate radio, or 2D cursor columns).
                 instruction_spans.push(" Next ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
             }
@@ -228,6 +281,16 @@ impl App {
                 let inner = wizard_block.inner(wizard_area);
                 frame.render_widget(wizard_block, wizard_area);
                 self.vcs_handler.render(frame, inner);
+            }
+            WizardStep::Languages => {
+                let inner = wizard_block.inner(wizard_area);
+                frame.render_widget(wizard_block, wizard_area);
+                self.languages_handler.render(frame, inner);
+            }
+            WizardStep::Workflows => {
+                let inner = wizard_block.inner(wizard_area);
+                frame.render_widget(wizard_block, wizard_area);
+                self.workflows_handler.render(frame, inner);
             }
             _ => {
                 let content = self.step_content();
@@ -282,9 +345,8 @@ impl App {
         match self.current_step() {
             WizardStep::ProjectType => String::new(), // handled by ProjectTypeHandler
             WizardStep::Vcs => String::new(),          // handled by VcsHandler
-            WizardStep::Languages => {
-                self.render_multi_select_list(Language::VARIANTS, &self.selected_languages)
-            }
+            WizardStep::Languages => String::new(),    // handled by LanguagesHandler
+            WizardStep::Workflows => String::new(),    // handled by WorkflowsHandler
             WizardStep::Database => self.render_select_list(Database::VARIANTS),
             WizardStep::Remotes => {
                 self.render_multi_select_list(Remote::VARIANTS, &self.selected_remotes)
@@ -355,8 +417,40 @@ impl App {
             }
             _ => {}
         }
+        // Languages (multi-line: one block per selected language)
+        if c.language_configs.is_empty() {
+            lines.push("Languages: —".to_string());
+        } else {
+            lines.push("Languages:".to_string());
+            for lc in &c.language_configs {
+                lines.push(format!("  {}:", lc.language));
+                if !lc.tools.is_empty() {
+                    lines.push(format!("    Tools: {}", lc.tools.join(", ")));
+                }
+                let mut deps: Vec<String> =
+                    lc.common_deps.iter().map(|d| (*d).to_string()).collect();
+                if !lc.custom_deps.trim().is_empty() {
+                    for dep in lc.custom_deps.split(',').map(|s| s.trim()) {
+                        if !dep.is_empty() {
+                            deps.push(dep.to_string());
+                        }
+                    }
+                }
+                if !deps.is_empty() {
+                    lines.push(format!("    Deps: {}", deps.join(", ")));
+                }
+            }
+        }
+        // Workflows
+        let ci = c.workflows.ci.map_or("—".to_string(), |v| v.to_string());
+        let pre = c
+            .workflows
+            .pre_commit
+            .map_or("—".to_string(), |v| v.to_string());
+        lines.push("Workflows:".to_string());
+        lines.push(format!("  CI: {ci}"));
+        lines.push(format!("  Pre-commit: {pre}"));
         lines.extend([
-            Self::format_config_list("Languages", &c.languages, "—"),
             format!(
                 "Database: {}",
                 c.database.map_or("—".to_string(), |v| v.to_string())
@@ -382,6 +476,8 @@ impl App {
 
         let mut actions = self.project_type_handler.planned_actions(&self.config);
         actions.extend(self.vcs_handler.planned_actions(&self.config));
+        actions.extend(self.languages_handler.planned_actions(&self.config));
+        actions.extend(self.workflows_handler.planned_actions(&self.config));
         if !actions.is_empty() {
             lines.push(String::new());
             lines.push("Planned actions:".to_string());
@@ -441,6 +537,24 @@ impl App {
                         }
                         return Ok(());
                     }
+                    WizardStep::Languages => {
+                        match self.languages_handler.handle_input(key, &mut self.config) {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
+                    }
+                    WizardStep::Workflows => {
+                        match self.workflows_handler.handle_input(key, &mut self.config) {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
@@ -465,6 +579,19 @@ impl App {
         &WizardStep::VARIANTS[self.step_index]
     }
 
+    /// Returns the `StepHandler` trait object for the current step, if one exists.
+    /// Steps that are still inline in `main.rs` (Database, Remotes, Extras, Summary)
+    /// return `None`; they'll return `Some` once extracted.
+    fn current_handler(&self) -> Option<&dyn StepHandler> {
+        match self.current_step() {
+            WizardStep::ProjectType => Some(&self.project_type_handler),
+            WizardStep::Vcs => Some(&self.vcs_handler),
+            WizardStep::Languages => Some(&self.languages_handler),
+            WizardStep::Workflows => Some(&self.workflows_handler),
+            _ => None,
+        }
+    }
+
     fn cursor_down(&mut self) {
         if self.cursor + 1 < self.current_step().option_count() {
             self.cursor += 1;
@@ -477,12 +604,12 @@ impl App {
 
     fn select_or_next(&mut self) {
         match self.current_step() {
-            WizardStep::ProjectType | WizardStep::Vcs => {} // handled by their handlers
+            // handler-owned steps: input goes through handle_events's delegation branch
+            WizardStep::ProjectType
+            | WizardStep::Vcs
+            | WizardStep::Languages
+            | WizardStep::Workflows => {}
             WizardStep::Database => self.select(),
-            WizardStep::Languages => {
-                self.config.languages = std::mem::take(&mut self.selected_languages);
-                self.next();
-            }
             WizardStep::Remotes => {
                 self.config.remotes = std::mem::take(&mut self.selected_remotes);
                 self.next();
@@ -501,15 +628,11 @@ impl App {
                 || matches!(self.current_step(), WizardStep::Summary)
         );
         match self.current_step() {
-            WizardStep::ProjectType | WizardStep::Vcs => {} // handled by their handlers
-            WizardStep::Languages => {
-                let lang = Language::VARIANTS[self.cursor];
-                if let Some(pos) = self.selected_languages.iter().position(|l| *l == lang) {
-                    self.selected_languages.remove(pos);
-                } else {
-                    self.selected_languages.push(lang);
-                }
-            }
+            // handler-owned steps
+            WizardStep::ProjectType
+            | WizardStep::Vcs
+            | WizardStep::Languages
+            | WizardStep::Workflows => {}
             WizardStep::Database => {
                 self.config.database = Some(Database::VARIANTS[self.cursor]);
                 self.next();
@@ -548,8 +671,12 @@ impl App {
                 return;
             }
             WizardStep::Languages => {
-                self.selected_languages.clone_from(&self.config.languages);
-                0
+                self.languages_handler.restore_from_config(&self.config);
+                return;
+            }
+            WizardStep::Workflows => {
+                self.workflows_handler.restore_from_config(&self.config);
+                return;
             }
             WizardStep::Database => self
                 .config
@@ -598,7 +725,9 @@ mod tests {
         assert!(c.vcs.is_none());
         assert!(c.default_branch.is_empty());
         assert!(!c.jj_colocate);
-        assert!(c.languages.is_empty());
+        assert!(c.language_configs.is_empty());
+        assert!(c.workflows.ci.is_none());
+        assert!(c.workflows.pre_commit.is_none());
         assert!(c.database.is_none());
         assert!(c.remotes.is_empty());
         assert!(c.extras.is_empty());
@@ -612,7 +741,7 @@ mod tests {
             ..Default::default()
         };
         assert!(c.vcs.is_none());
-        assert!(c.languages.is_empty());
+        assert!(c.language_configs.is_empty());
 
         c.vcs = Some(Vcs::Git);
         c.default_branch = "develop".to_string();
@@ -708,10 +837,17 @@ mod tests {
 
     // --- Cursor movement ---
 
+    fn step_index_of(step: WizardStep) -> usize {
+        WizardStep::VARIANTS
+            .iter()
+            .position(|s| std::mem::discriminant(s) == std::mem::discriminant(&step))
+            .unwrap()
+    }
+
     #[test]
     fn cursor_down_respects_option_count() {
         let mut app = App {
-            step_index: 2, // Languages
+            step_index: step_index_of(WizardStep::Database),
             cursor: 0,
             ..Default::default()
         };
@@ -725,7 +861,7 @@ mod tests {
     #[test]
     fn cursor_up_clamps_at_zero() {
         let mut app = App {
-            step_index: 2,
+            step_index: step_index_of(WizardStep::Database),
             cursor: 2,
             ..Default::default()
         };
@@ -737,44 +873,15 @@ mod tests {
         assert_eq!(app.cursor, 0);
     }
 
-    // --- Multi-select toggling ---
-
-    #[test]
-    fn language_toggle_on_and_off() {
-        let mut app = App {
-            step_index: 2, // Languages
-            cursor: 0,     // Rust
-            ..Default::default()
-        };
-        app.select();
-        assert_eq!(app.selected_languages.len(), 1);
-        assert_eq!(app.selected_languages[0], Language::Rust);
-        app.select();
-        assert!(app.selected_languages.is_empty());
-    }
-
-    #[test]
-    fn multiple_languages_can_be_selected() {
-        let mut app = App {
-            step_index: 2,
-            cursor: 0, // Rust
-            ..Default::default()
-        };
-        app.select();
-        app.cursor = 2; // Python
-        app.select();
-        assert_eq!(app.selected_languages.len(), 2);
-        assert!(app.selected_languages.contains(&Language::Rust));
-        assert!(app.selected_languages.contains(&Language::Python));
-    }
+    // Language multi-select behavior is now tested in steps::languages::tests.
 
     // --- Database single-select ---
 
     #[test]
     fn database_select_commits_and_advances() {
         let mut app = App {
-            step_index: 3, // Database
-            cursor: 0,     // PostgreSQL
+            step_index: step_index_of(WizardStep::Database),
+            cursor: 0, // PostgreSQL
             ..Default::default()
         };
         let old_step = app.step_index;
@@ -797,19 +904,8 @@ mod tests {
         assert!(app.exit);
     }
 
-    // --- select_or_next for multi-selects ---
-
-    #[test]
-    fn select_or_next_commits_languages() {
-        let mut app = App {
-            step_index: 2, // Languages
-            selected_languages: vec![Language::Rust, Language::Go],
-            ..Default::default()
-        };
-        app.select_or_next();
-        assert_eq!(app.config.languages, vec![Language::Rust, Language::Go]);
-        assert_eq!(app.step_index, 3);
-    }
+    // select_or_next for Languages is now tested in steps::languages::tests
+    // (right_commits_selected_and_returns_done).
 
     // --- Config summary formatting ---
 
@@ -858,6 +954,45 @@ mod tests {
         let summary = app.config_summary();
         assert!(summary.contains("Mode: Native"));
         assert!(!summary.contains("Default branch:"));
+    }
+
+    // --- format_config_list ---
+
+    // --- Workflows step placement + count ---
+
+    #[test]
+    fn step_count_is_eight() {
+        assert_eq!(WizardStep::VARIANTS.len(), 8);
+    }
+
+    #[test]
+    fn workflows_step_is_inserted_between_languages_and_database() {
+        let languages = step_index_of(WizardStep::Languages);
+        let workflows = step_index_of(WizardStep::Workflows);
+        let database = step_index_of(WizardStep::Database);
+        assert_eq!(workflows, languages + 1);
+        assert_eq!(database, workflows + 1);
+    }
+
+    #[test]
+    fn summary_shows_language_tools_and_workflows() {
+        let mut app = App::default();
+        app.config.language_configs = vec![LanguageConfig {
+            language: Language::Python,
+            tools: vec!["ruff", "pytest"],
+            common_deps: vec!["fastapi"],
+            custom_deps: "my-lib".to_string(),
+        }];
+        app.config.workflows = WorkflowConfig {
+            ci: Some(CiProvider::GitHubActions),
+            pre_commit: Some(PreCommitFramework::PreCommit),
+        };
+        let summary = app.config_summary();
+        assert!(summary.contains("Python:"));
+        assert!(summary.contains("Tools: ruff, pytest"));
+        assert!(summary.contains("Deps: fastapi, my-lib"));
+        assert!(summary.contains("CI: GitHub Actions"));
+        assert!(summary.contains("Pre-commit: pre-commit"));
     }
 
     // --- format_config_list ---

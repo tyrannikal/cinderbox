@@ -65,14 +65,6 @@ impl Default for ProjectTypeHandler {
 }
 
 impl ProjectTypeHandler {
-    pub fn in_details(&self) -> bool {
-        matches!(self.focus, Focus::SubField(_) | Focus::Browsing)
-    }
-
-    pub fn is_expanded(&self) -> bool {
-        self.expanded.is_some()
-    }
-
     /// Restore cursor position from existing config when navigating back
     pub fn restore_from_config(&mut self, config: &ProjectConfig) {
         if let Some(pt) = &config.project_type {
@@ -573,6 +565,14 @@ impl StepHandler for ProjectTypeHandler {
             Focus::SubField(n) => self.handle_subfield(key.code, n, config),
             Focus::Browsing => self.handle_browsing(key),
         }
+    }
+
+    fn in_details(&self) -> bool {
+        matches!(self.focus, Focus::SubField(_) | Focus::Browsing)
+    }
+
+    fn is_expanded(&self) -> bool {
+        self.expanded.is_some()
     }
 
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String> {

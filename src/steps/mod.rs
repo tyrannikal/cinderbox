@@ -3,8 +3,10 @@ use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 use crate::ProjectConfig;
 
+pub mod languages;
 pub mod project_type;
 pub mod vcs;
+pub mod workflows;
 
 pub enum StepResult {
     Continue,
@@ -39,6 +41,17 @@ pub trait StepHandler {
     fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult;
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String>;
     fn execute(&self, config: &ProjectConfig) -> std::io::Result<()>;
+    /// True when focus is inside a sub-panel (text input, radio row, browse button, etc.),
+    /// rather than on the top-level choice list. Drives the "Back <Esc>" / "Next <Enter>"
+    /// variant of the instruction bar.
+    fn in_details(&self) -> bool {
+        false
+    }
+    /// True when a choice's sub-panel is currently revealed, regardless of where focus sits.
+    /// Drives the "Collapse <←/H>" hint.
+    fn is_expanded(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

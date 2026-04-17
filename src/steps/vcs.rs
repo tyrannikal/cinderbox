@@ -37,14 +37,6 @@ impl Default for VcsHandler {
 }
 
 impl VcsHandler {
-    pub fn in_details(&self) -> bool {
-        matches!(self.focus, Focus::SubField(_))
-    }
-
-    pub fn is_expanded(&self) -> bool {
-        self.expanded.is_some()
-    }
-
     /// Restore state from existing config when navigating back
     pub fn restore_from_config(&mut self, config: &ProjectConfig) {
         let Some(vcs) = config.vcs else { return };
@@ -320,6 +312,14 @@ impl StepHandler for VcsHandler {
             Focus::SubField(n) => self.handle_subfield(key, n, config),
             Focus::Browsing => unreachable!(),
         }
+    }
+
+    fn in_details(&self) -> bool {
+        matches!(self.focus, Focus::SubField(_))
+    }
+
+    fn is_expanded(&self) -> bool {
+        self.expanded.is_some()
     }
 
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String> {
