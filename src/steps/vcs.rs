@@ -82,11 +82,11 @@ impl VcsHandler {
         config.vcs = Some(vcs);
         match vcs {
             Vcs::Git => {
-                config.default_branch = self.default_branch_input.value.clone();
+                config.default_branch = self.default_branch_input.value().to_string();
                 config.jj_colocate = false;
             }
             Vcs::Jujutsu => {
-                config.default_branch = self.default_branch_input.value.clone();
+                config.default_branch = self.default_branch_input.value().to_string();
                 config.jj_colocate = self.jj_colocate;
             }
             Vcs::None => {
@@ -107,6 +107,23 @@ impl VcsHandler {
         };
         let style = Style::default().fg(color);
         frame.render_widget(Paragraph::new(Line::from(text).style(style)), area);
+    }
+
+    /// Vertical layout for the step, driven by which choice is expanded.
+    /// Each choice label takes one row; expanded sub-fields add extra rows.
+    fn layout_constraints(&self) -> Vec<Constraint> {
+        let mut constraints = vec![Constraint::Length(1)]; // "Git" label
+        if self.expanded == Some(Vcs::Git) {
+            constraints.push(Constraint::Length(3)); // default branch input
+        }
+        constraints.push(Constraint::Length(1)); // "Jujutsu" label
+        if self.expanded == Some(Vcs::Jujutsu) {
+            constraints.push(Constraint::Length(1)); // colocate row
+            constraints.push(Constraint::Length(3)); // default branch input
+        }
+        constraints.push(Constraint::Length(1)); // "None" label
+        constraints.push(Constraint::Min(1)); // spacer
+        constraints
     }
 
     fn handle_choice(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
@@ -157,6 +174,10 @@ impl VcsHandler {
         let choice = self
             .expanded
             .expect("SubField focus implies expanded is Some");
+        debug_assert!(
+            VCS_CHOICES.contains(&choice),
+            "expanded choice must be one of VCS_CHOICES"
+        );
 
         // Common navigation keys (apply to any sub-field)
         match key {
@@ -173,7 +194,11 @@ impl VcsHandler {
                     self.focus = Focus::SubField(field + 1);
                 } else {
                     // Past last sub-field — jump to next choice in the list
-                    let next_idx = VCS_CHOICES.iter().position(|v| *v == choice).unwrap_or(0) + 1;
+                    let choice_idx = VCS_CHOICES
+                        .iter()
+                        .position(|v| *v == choice)
+                        .expect("choice is always in VCS_CHOICES");
+                    let next_idx = choice_idx + 1;
                     if next_idx < VCS_CHOICES.len() {
                         self.choice_cursor = next_idx;
                         self.focus = Focus::Choice;
@@ -228,26 +253,7 @@ impl VcsHandler {
 
 impl StepHandler for VcsHandler {
     fn render(&self, frame: &mut Frame, area: Rect) {
-        // Build layout constraints dynamically based on expanded state
-        let mut constraints: Vec<Constraint> = vec![];
-
-        // "Git" label
-        constraints.push(Constraint::Length(1));
-        if self.expanded == Some(Vcs::Git) {
-            constraints.push(Constraint::Length(3)); // default branch input
-        }
-        // "Jujutsu" label
-        constraints.push(Constraint::Length(1));
-        if self.expanded == Some(Vcs::Jujutsu) {
-            constraints.push(Constraint::Length(1)); // colocate row
-            constraints.push(Constraint::Length(3)); // default branch input
-        }
-        // "None" label
-        constraints.push(Constraint::Length(1));
-        // Spacer
-        constraints.push(Constraint::Min(1));
-
-        let areas: Vec<Rect> = Layout::vertical(constraints).split(area).to_vec();
+        let areas = Layout::vertical(self.layout_constraints()).split(area);
         let mut idx = 0;
 
         // Git
@@ -370,7 +376,7 @@ mod tests {
         assert_eq!(h.focus, Focus::Choice);
         assert!(h.expanded.is_none());
         assert_eq!(h.choice_cursor, 0);
-        assert_eq!(h.default_branch_input.value, "main");
+        assert_eq!(h.default_branch_input.value(), "main");
         assert!(h.jj_colocate);
     }
 
@@ -624,7 +630,7 @@ mod tests {
         assert_eq!(h.choice_cursor, 0);
         assert_eq!(h.expanded, Some(Vcs::Git));
         assert_eq!(h.focus, Focus::SubField(0));
-        assert_eq!(h.default_branch_input.value, "develop");
+        assert_eq!(h.default_branch_input.value(), "develop");
     }
 
     #[test]

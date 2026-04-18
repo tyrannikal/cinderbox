@@ -94,14 +94,14 @@ impl ProjectTypeHandler {
     fn full_path(&self) -> PathBuf {
         match self.expanded {
             Some(TypeChoice::New) => {
-                PathBuf::from(&self.location_input.value).join(&self.name_input.value)
+                PathBuf::from(self.location_input.value()).join(self.name_input.value())
             }
-            _ => PathBuf::from(&self.location_input.value),
+            _ => PathBuf::from(self.location_input.value()),
         }
     }
 
     fn derived_name(&self) -> String {
-        let path = PathBuf::from(&self.location_input.value);
+        let path = PathBuf::from(self.location_input.value());
         path.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
@@ -116,8 +116,8 @@ impl ProjectTypeHandler {
 
         match choice {
             TypeChoice::New => {
-                let name = &self.name_input.value;
-                let location = &self.location_input.value;
+                let name = self.name_input.value();
+                let location = self.location_input.value();
                 if name.is_empty() {
                     self.validation_msg = "Project name is required.".to_string();
                 } else if path.exists() {
@@ -131,7 +131,7 @@ impl ProjectTypeHandler {
                 }
             }
             TypeChoice::Existing => {
-                let location = &self.location_input.value;
+                let location = self.location_input.value();
                 if location.is_empty() {
                     self.validation_msg = "Location is required.".to_string();
                 } else if !path.exists() {
@@ -150,12 +150,12 @@ impl ProjectTypeHandler {
         };
         match choice {
             TypeChoice::New => {
-                !self.name_input.value.is_empty()
+                !self.name_input.value().is_empty()
                     && !self.full_path().exists()
-                    && PathBuf::from(&self.location_input.value).exists()
+                    && PathBuf::from(self.location_input.value()).exists()
             }
             TypeChoice::Existing => {
-                !self.location_input.value.is_empty() && self.full_path().exists()
+                !self.location_input.value().is_empty() && self.full_path().exists()
             }
         }
     }
@@ -341,13 +341,13 @@ impl ProjectTypeHandler {
                     match choice {
                         TypeChoice::New => {
                             config.project_type = Some(crate::ProjectType::New);
-                            config.project_name = self.name_input.value.clone();
-                            config.project_location = self.location_input.value.clone();
+                            config.project_name = self.name_input.value().to_string();
+                            config.project_location = self.location_input.value().to_string();
                         }
                         TypeChoice::Existing => {
                             config.project_type = Some(crate::ProjectType::Existing);
                             config.project_name = self.derived_name();
-                            config.project_location = self.location_input.value.clone();
+                            config.project_location = self.location_input.value().to_string();
                         }
                     }
                     StepResult::Done
@@ -390,7 +390,7 @@ impl ProjectTypeHandler {
         };
 
         // Start in the location input's directory if it's valid
-        let start_dir = PathBuf::from(&self.location_input.value);
+        let start_dir = PathBuf::from(self.location_input.value());
         if start_dir.is_dir() {
             let _ = explorer.set_cwd(&start_dir);
         }
@@ -788,7 +788,7 @@ mod tests {
         h.handle_input(key(KeyCode::Enter), &mut c); // expand New, focus name
         h.handle_input(key(KeyCode::Char('a')), &mut c);
         h.handle_input(key(KeyCode::Char('b')), &mut c);
-        assert_eq!(h.name_input.value, "ab");
+        assert_eq!(h.name_input.value(), "ab");
     }
 
     #[test]
@@ -800,7 +800,7 @@ mod tests {
         // Clear existing location value first
         h.location_input = TextInput::new("Location");
         h.handle_input(key(KeyCode::Char('/')), &mut c);
-        assert!(h.location_input.value.contains('/'));
+        assert!(h.location_input.value().contains('/'));
     }
 
     // --- planned_actions ---

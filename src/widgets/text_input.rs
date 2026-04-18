@@ -9,7 +9,7 @@ use ratatui::{
 
 #[derive(Debug, Default)]
 pub struct TextInput {
-    pub value: String,
+    value: String,
     cursor: usize,
     pub label: String,
 }
@@ -31,6 +31,10 @@ impl TextInput {
     pub fn set_value(&mut self, value: impl Into<String>) {
         self.value = value.into();
         self.cursor = self.cursor.min(self.value.len());
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
     }
 
     pub fn handle_input(&mut self, key: KeyCode) {

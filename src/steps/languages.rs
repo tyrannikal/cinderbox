@@ -147,7 +147,7 @@ impl LanguagesHandler {
 
     fn collapse_persist(&mut self) {
         if let Some(lang) = self.expanded {
-            let value = self.custom_deps_input.value.clone();
+            let value = self.custom_deps_input.value().to_string();
             self.scratch_mut_for(lang).custom_deps = value;
         }
         self.expanded = None;
@@ -159,7 +159,7 @@ impl LanguagesHandler {
         // value reflects the latest keystrokes (in case Enter was pressed
         // from inside the text input without an explicit collapse first).
         if let Some(lang) = self.expanded {
-            let value = self.custom_deps_input.value.clone();
+            let value = self.custom_deps_input.value().to_string();
             self.scratch_mut_for(lang).custom_deps = value;
         }
         let mut new_configs: Vec<LanguageConfig> = Vec::with_capacity(self.selected.len());
@@ -346,7 +346,7 @@ impl LanguagesHandler {
                 _ => {}
             }
             // Persist live — scratch stays in sync with what's on screen.
-            let value = self.custom_deps_input.value.clone();
+            let value = self.custom_deps_input.value().to_string();
             self.scratch_mut_for(lang).custom_deps = value;
             return StepResult::Continue;
         }
@@ -393,7 +393,7 @@ impl LanguagesHandler {
     /// ProjectType/VCS convention where Up from row 0 does NOT collapse.
     fn collapse_persist_keep_expanded(&mut self) {
         if let Some(lang) = self.expanded {
-            let value = self.custom_deps_input.value.clone();
+            let value = self.custom_deps_input.value().to_string();
             self.scratch_mut_for(lang).custom_deps = value;
         }
     }
@@ -906,7 +906,7 @@ mod tests {
         for ch in "my-lib,other".chars() {
             h.handle_input(key(KeyCode::Char(ch)), &mut c);
         }
-        assert_eq!(h.custom_deps_input.value, "my-lib,other");
+        assert_eq!(h.custom_deps_input.value(), "my-lib,other");
         assert_eq!(
             h.scratch_for(Language::Python).unwrap().custom_deps,
             "my-lib,other"
