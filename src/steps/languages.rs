@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
 };
 use strum::VariantArray;
 
@@ -17,10 +17,20 @@ use super::{CURSOR_BLANK, CURSOR_MARKER, Focus, StepHandler, StepResult};
 const DEPS_PER_ROW: usize = 3;
 const INDENT_SUBPANEL: u16 = 4;
 const INDENT_ROW: u16 = 6;
+const CONFIRM_BUTTON_WIDTH: u16 = 12;
+const CONFIRM_BUTTON_HEIGHT: u16 = 3;
+
+/// A language is "supported" when its registry entry has any tool categories
+/// or common dependencies. Unsupported languages render grayed-out and
+/// cannot be toggled or expanded.
+fn is_supported(lang: Language) -> bool {
+    let spec = spec_for(lang);
+    !spec.categories.is_empty() || !spec.common_deps.is_empty()
+}
 
 /// One interactive row inside an expanded language's sub-panel.
 /// Drives the handler's 2D cursor (row_cursor × col_cursor) and the render walk.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum NavRow {
     /// The N checkboxes for a single tool category.
     CategoryTools { cat_idx: usize },
@@ -28,6 +38,9 @@ enum NavRow {
     CommonDeps { start: usize, end: usize },
     /// The free-text custom-deps input.
     CustomDepsInput,
+    /// Bordered "Confirm" button rendered at the bottom of the sub-panel.
+    /// Pressing Enter or Space on it collapses the panel (keeping the language checked).
+    Confirm,
 }
 
 impl NavRow {
@@ -36,27 +49,29 @@ impl NavRow {
             NavRow::CategoryTools { cat_idx } => spec.categories[*cat_idx].tools.len(),
             NavRow::CommonDeps { start, end } => end - start,
             NavRow::CustomDepsInput => 1,
+            NavRow::Confirm => 1,
         }
     }
 }
 
-/// Build the interactive rows for a language's spec. Returns an empty vec when the
-/// spec has no categories AND no common deps — which is the "empty-spec" case.
+/// Build the interactive rows for a language's spec. Always ends with a
+/// `NavRow::Confirm` so users have an explicit affordance to close the
+/// sub-panel — even for empty-spec languages, where Confirm is the only row.
 fn nav_rows(spec: &LanguageSpec) -> Vec<NavRow> {
-    if spec.categories.is_empty() && spec.common_deps.is_empty() {
-        return Vec::new();
-    }
     let mut rows: Vec<NavRow> = Vec::new();
-    for cat_idx in 0..spec.categories.len() {
-        rows.push(NavRow::CategoryTools { cat_idx });
+    if !spec.categories.is_empty() || !spec.common_deps.is_empty() {
+        for cat_idx in 0..spec.categories.len() {
+            rows.push(NavRow::CategoryTools { cat_idx });
+        }
+        let mut start = 0;
+        while start < spec.common_deps.len() {
+            let end = (start + DEPS_PER_ROW).min(spec.common_deps.len());
+            rows.push(NavRow::CommonDeps { start, end });
+            start = end;
+        }
+        rows.push(NavRow::CustomDepsInput);
     }
-    let mut start = 0;
-    while start < spec.common_deps.len() {
-        let end = (start + DEPS_PER_ROW).min(spec.common_deps.len());
-        rows.push(NavRow::CommonDeps { start, end });
-        start = end;
-    }
-    rows.push(NavRow::CustomDepsInput);
+    rows.push(NavRow::Confirm);
     rows
 }
 
@@ -81,7 +96,7 @@ impl Default for LanguagesHandler {
             focus: Focus::Choice,
             row_cursor: 0,
             col_cursor: 0,
-            custom_deps_input: TextInput::new("Custom deps (comma-separated)"),
+            custom_deps_input: TextInput::new("Custom dependencies (comma-separated)"),
             scratch: Vec::new(),
         }
     }
@@ -99,20 +114,11 @@ impl LanguagesHandler {
         self.focus = Focus::Choice;
         self.row_cursor = 0;
         self.col_cursor = 0;
-        self.custom_deps_input = TextInput::new("Custom deps (comma-separated)");
+        self.custom_deps_input = TextInput::new("Custom dependencies (comma-separated)");
     }
 
     fn is_selected(&self, lang: Language) -> bool {
         self.selected.contains(&lang)
-    }
-
-    fn toggle_at_cursor(&mut self) {
-        let lang = Language::VARIANTS[self.cursor];
-        if let Some(pos) = self.selected.iter().position(|l| *l == lang) {
-            self.selected.remove(pos);
-        } else {
-            self.selected.push(lang);
-        }
     }
 
     fn scratch_for(&self, lang: Language) -> Option<&LanguageConfig> {
@@ -141,7 +147,7 @@ impl LanguagesHandler {
         self.focus = Focus::SubField(0);
         self.row_cursor = 0;
         self.col_cursor = 0;
-        self.custom_deps_input = TextInput::new("Custom deps (comma-separated)");
+        self.custom_deps_input = TextInput::new("Custom dependencies (comma-separated)");
         self.custom_deps_input.set_value(starting_value);
     }
 
@@ -217,7 +223,7 @@ impl LanguagesHandler {
                     scratch.common_deps.push(dep_id);
                 }
             }
-            NavRow::CustomDepsInput => {}
+            NavRow::CustomDepsInput | NavRow::Confirm => {}
         }
     }
 
@@ -233,11 +239,26 @@ impl LanguagesHandler {
 
     // --- Input handling ---
 
-    fn handle_choice_input(&mut self, key: KeyCode) -> StepResult {
+    /// Total choice-row count: the "Next" pseudo-row plus one row per language.
+    fn choice_count(&self) -> usize {
+        Language::VARIANTS.len() + 1
+    }
+
+    /// Returns the language for the current cursor, or `None` if the cursor is
+    /// on the "Next" pseudo-row at index 0.
+    fn cursor_lang(&self) -> Option<Language> {
+        if self.cursor == 0 {
+            None
+        } else {
+            Some(Language::VARIANTS[self.cursor - 1])
+        }
+    }
+
+    fn handle_choice_input(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
         match key {
             KeyCode::Char('q') => StepResult::Quit,
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.cursor + 1 < Language::VARIANTS.len() {
+                if self.cursor + 1 < self.choice_count() {
                     self.cursor += 1;
                 }
                 StepResult::Continue
@@ -246,17 +267,31 @@ impl LanguagesHandler {
                 self.cursor = self.cursor.saturating_sub(1);
                 StepResult::Continue
             }
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.toggle_at_cursor();
-                StepResult::Continue
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                let lang = Language::VARIANTS[self.cursor];
-                if self.is_selected(lang) {
-                    self.expand(lang);
+            KeyCode::Char(' ') => {
+                // Space toggles the language under the cursor (only on supported langs).
+                // Has no effect on the "Next" pseudo-row or unsupported languages.
+                if let Some(lang) = self.cursor_lang()
+                    && is_supported(lang)
+                {
+                    self.toggle_lang(lang);
                 }
                 StepResult::Continue
             }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match self.cursor_lang() {
+                None => {
+                    // "Next" — commit current selections (possibly empty) and advance.
+                    self.commit_to_config(config);
+                    StepResult::Done
+                }
+                Some(lang) if is_supported(lang) => {
+                    if !self.is_selected(lang) {
+                        self.selected.push(lang);
+                    }
+                    self.expand(lang);
+                    StepResult::Continue
+                }
+                Some(_) => StepResult::Continue, // unsupported: no-op
+            },
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.expanded.is_some() {
                     self.collapse_persist();
@@ -269,27 +304,30 @@ impl LanguagesHandler {
         }
     }
 
-    fn handle_subfield_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
+    /// Toggle a specific language's selection. Used by Space at Choice focus.
+    fn toggle_lang(&mut self, lang: Language) {
+        if let Some(pos) = self.selected.iter().position(|l| *l == lang) {
+            self.selected.remove(pos);
+        } else {
+            self.selected.push(lang);
+        }
+    }
+
+    fn handle_subfield_input(&mut self, key: KeyEvent, _config: &mut ProjectConfig) -> StepResult {
         let Some(lang) = self.expanded else {
             return StepResult::Continue;
         };
         let spec = spec_for(lang);
         let rows = nav_rows(spec);
 
-        // Empty-spec: only Esc / Shift+arrow-style keys make sense.
+        // nav_rows always returns at least Confirm, but guard regardless.
         if rows.is_empty() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.focus = Focus::Choice;
-                    return StepResult::Continue;
-                }
-                KeyCode::Char('q') => return StepResult::Quit,
-                _ => return StepResult::Continue,
-            }
+            return StepResult::Continue;
         }
 
         let row = rows[self.row_cursor];
         let on_text = matches!(row, NavRow::CustomDepsInput);
+        let on_confirm = matches!(row, NavRow::Confirm);
 
         // Universal nav keys (apply regardless of row kind).
         match key.code {
@@ -323,10 +361,40 @@ impl LanguagesHandler {
                 return StepResult::Continue;
             }
             KeyCode::Enter => {
-                self.commit_to_config(config);
-                return StepResult::Done;
+                // Enter inside the sub-menu always confirms — collapse and return
+                // focus to the choice list. The language stays checked; the user
+                // advances to the next step from the "Next" pseudo-row at the top.
+                self.collapse_persist();
+                return StepResult::Continue;
             }
             _ => {}
+        }
+
+        // Confirm-button row: Space also collapses; horizontal nav is a no-op.
+        if on_confirm {
+            match key.code {
+                KeyCode::Char('q') => return StepResult::Quit,
+                KeyCode::Char(' ') => {
+                    self.collapse_persist();
+                }
+                KeyCode::Char('k') => {
+                    if self.row_cursor == 0 {
+                        self.collapse_persist_keep_expanded();
+                        self.focus = Focus::Choice;
+                    } else {
+                        self.row_cursor -= 1;
+                        self.clamp_col(spec);
+                    }
+                }
+                KeyCode::Char('j') => {
+                    if self.row_cursor + 1 < rows.len() {
+                        self.row_cursor += 1;
+                        self.clamp_col(spec);
+                    }
+                }
+                _ => {}
+            }
+            return StepResult::Continue;
         }
 
         // Row-kind-specific handling.
@@ -429,24 +497,60 @@ impl LanguagesHandler {
 
     // --- Rendering ---
 
+    fn render_next_line(&self, frame: &mut Frame, area: Rect) {
+        let highlighted = matches!(self.focus, Focus::Choice) && self.cursor == 0;
+        let cursor_marker = if highlighted { CURSOR_MARKER } else { CURSOR_BLANK };
+        let style = Style::default().add_modifier(Modifier::BOLD);
+        let text = format!("{cursor_marker}Next →");
+        frame.render_widget(Paragraph::new(Line::from(text).style(style)), area);
+    }
+
     fn render_choice_line(&self, frame: &mut Frame, area: Rect, lang: Language, idx: usize) {
         let cursor_marker = if matches!(self.focus, Focus::Choice) && idx == self.cursor {
             CURSOR_MARKER
         } else {
             CURSOR_BLANK
         };
+        let supported = is_supported(lang);
         let check = if self.is_selected(lang) { "[x]" } else { "[ ]" };
         let text = format!("{cursor_marker}{check} {lang}");
-        frame.render_widget(Paragraph::new(text), area);
+        let line = if supported {
+            Line::from(text)
+        } else {
+            Line::from(text).style(Style::default().fg(Color::DarkGray))
+        };
+        frame.render_widget(Paragraph::new(line), area);
+    }
+
+    fn render_confirm_button(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let block_style = if focused {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::bordered().style(block_style);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let label_style = if focused {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from("Confirm").style(label_style)).centered(),
+            inner,
+        );
     }
 
     fn render_expanded_panel(&self, frame: &mut Frame, lang: Language, area: Rect) -> u16 {
         let spec = spec_for(lang);
-        let rows = nav_rows(spec);
+        let _rows = nav_rows(spec);
         let mut y = area.y;
         let bottom = area.y + area.height;
+        let has_tools = !spec.categories.is_empty() || !spec.common_deps.is_empty();
 
-        if rows.is_empty() {
+        if !has_tools {
             if y < bottom {
                 let rect = Rect {
                     x: area.x + INDENT_SUBPANEL,
@@ -460,6 +564,8 @@ impl LanguagesHandler {
                 );
                 y += 1;
             }
+            // Even empty-spec languages get a Confirm button (the only nav row).
+            y = self.render_confirm_at(frame, area, y, bottom, 0);
             return y;
         }
 
@@ -501,7 +607,7 @@ impl LanguagesHandler {
                 height: 1,
             };
             frame.render_widget(
-                Paragraph::new(Line::from("Common deps:").style(Style::default().add_modifier(Modifier::BOLD))),
+                Paragraph::new(Line::from("Common dependencies:").style(Style::default().add_modifier(Modifier::BOLD))),
                 label_rect,
             );
             y += 1;
@@ -528,7 +634,7 @@ impl LanguagesHandler {
             }
         }
 
-        // Custom deps label + TextInput
+        // Custom dependencies label + TextInput
         if y >= bottom { return y; }
         let label_rect = Rect {
             x: area.x + INDENT_SUBPANEL,
@@ -537,7 +643,7 @@ impl LanguagesHandler {
             height: 1,
         };
         frame.render_widget(
-            Paragraph::new(Line::from("Custom deps:").style(Style::default().add_modifier(Modifier::BOLD))),
+            Paragraph::new(Line::from("Custom dependencies:").style(Style::default().add_modifier(Modifier::BOLD))),
             label_rect,
         );
         y += 1;
@@ -554,7 +660,34 @@ impl LanguagesHandler {
             self.custom_deps_input.render(frame, input_rect, focused);
             y += 3;
         }
-        let _ = rows; // shape used via nav_row_idx
+        nav_row_idx += 1;
+
+        // Confirm button at the bottom of the sub-panel.
+        y = self.render_confirm_at(frame, area, y, bottom, nav_row_idx);
+        y
+    }
+
+    fn render_confirm_at(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        mut y: u16,
+        bottom: u16,
+        confirm_row_idx: usize,
+    ) -> u16 {
+        if y + CONFIRM_BUTTON_HEIGHT > bottom {
+            return y;
+        }
+        let button_rect = Rect {
+            x: area.x + INDENT_ROW,
+            y,
+            width: CONFIRM_BUTTON_WIDTH.min(area.width.saturating_sub(INDENT_ROW)),
+            height: CONFIRM_BUTTON_HEIGHT,
+        };
+        let focused =
+            matches!(self.focus, Focus::SubField(_)) && self.row_cursor == confirm_row_idx;
+        self.render_confirm_button(frame, button_rect, focused);
+        y += CONFIRM_BUTTON_HEIGHT;
         y
     }
 
@@ -619,6 +752,19 @@ impl StepHandler for LanguagesHandler {
     fn render(&self, frame: &mut Frame, area: Rect) {
         let mut y = area.y;
         let bottom = area.y + area.height;
+
+        // "Next" pseudo-row at index 0 — commits selections (possibly empty) on activation.
+        if y < bottom {
+            let next_rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            self.render_next_line(frame, next_rect);
+            y += 1;
+        }
+
         for (i, lang) in Language::VARIANTS.iter().enumerate() {
             if y >= bottom {
                 break;
@@ -629,7 +775,8 @@ impl StepHandler for LanguagesHandler {
                 width: area.width,
                 height: 1,
             };
-            self.render_choice_line(frame, choice_rect, *lang, i);
+            // Cursor index 0 is "Next"; languages start at 1.
+            self.render_choice_line(frame, choice_rect, *lang, i + 1);
             y += 1;
             if self.expanded == Some(*lang) {
                 let panel_area = Rect {
@@ -645,7 +792,7 @@ impl StepHandler for LanguagesHandler {
 
     fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
         match self.focus {
-            Focus::Choice => self.handle_choice_input(key.code),
+            Focus::Choice => self.handle_choice_input(key.code, config),
             Focus::SubField(_) => self.handle_subfield_input(key, config),
             Focus::Browsing => StepResult::Continue,
         }
@@ -723,7 +870,8 @@ mod tests {
         for _ in 0..100 {
             h.handle_input(key(KeyCode::Down), &mut c);
         }
-        assert_eq!(h.cursor, Language::VARIANTS.len() - 1);
+        // Cursor count is 1 ("Next") + Language::VARIANTS.len(), so the max index is `len`.
+        assert_eq!(h.cursor, Language::VARIANTS.len());
         for _ in 0..100 {
             h.handle_input(key(KeyCode::Up), &mut c);
         }
@@ -731,21 +879,72 @@ mod tests {
     }
 
     #[test]
-    fn enter_toggles_checked_state() {
+    fn enter_on_next_commits_and_advances() {
+        // Cursor 0 is the "Next" pseudo-row; pressing Enter there commits the
+        // current (possibly empty) selection and advances the wizard.
         let mut h = LanguagesHandler::default();
         let mut c = ProjectConfig::default();
-        h.handle_input(key(KeyCode::Enter), &mut c);
-        assert_eq!(h.selected, vec![Language::VARIANTS[0]]);
-        h.handle_input(key(KeyCode::Enter), &mut c);
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert!(c.language_configs.is_empty());
+    }
+
+    #[test]
+    fn right_on_next_commits_and_advances() {
+        let mut h = LanguagesHandler::default();
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Right), &mut c);
+        assert!(matches!(result, StepResult::Done));
+    }
+
+    #[test]
+    fn enter_on_supported_lang_checks_and_expands() {
+        // Cursor on Rust (index 1 in choice rows): Enter checks the language
+        // (if not already) AND expands its sub-menu.
+        let mut h = with_cursor_on(Language::Rust);
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.is_selected(Language::Rust));
+        assert_eq!(h.expanded, Some(Language::Rust));
+        assert_eq!(h.focus, Focus::SubField(0));
+    }
+
+    #[test]
+    fn enter_on_unsupported_lang_is_noop() {
+        let mut h = with_cursor_on(Language::Go);
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(!h.is_selected(Language::Go));
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn space_toggles_supported_lang() {
+        let mut h = with_cursor_on(Language::Rust);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert_eq!(h.selected, vec![Language::Rust]);
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
         assert!(h.selected.is_empty());
     }
 
     #[test]
-    fn space_also_toggles() {
-        let mut h = LanguagesHandler::default();
+    fn space_on_unsupported_lang_is_noop() {
+        let mut h = with_cursor_on(Language::Go);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert_eq!(h.selected, vec![Language::VARIANTS[0]]);
+        assert!(h.selected.is_empty());
+    }
+
+    #[test]
+    fn space_on_next_is_noop() {
+        let mut h = LanguagesHandler::default();
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.selected.is_empty());
     }
 
     #[test]
@@ -767,13 +966,27 @@ mod tests {
     // --- Expansion semantics ---
 
     #[test]
-    fn right_on_unchecked_language_does_not_expand() {
-        let mut h = LanguagesHandler::default();
+    fn right_on_unsupported_language_is_noop() {
+        // Unsupported languages (no registry spec) are unselectable; Right does nothing.
+        let mut h = with_cursor_on(Language::Go);
         let mut c = ProjectConfig::default();
         let result = h.handle_input(key(KeyCode::Right), &mut c);
         assert!(matches!(result, StepResult::Continue));
         assert!(h.expanded.is_none());
         assert_eq!(h.focus, Focus::Choice);
+    }
+
+    #[test]
+    fn right_on_unchecked_supported_language_expands_and_checks() {
+        // QA #7: expanding via right arrow / L should work without first toggling
+        // the language on. Right both checks and expands in a single step.
+        let mut h = with_cursor_on(Language::Python);
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Right), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.is_selected(Language::Python));
+        assert_eq!(h.expanded, Some(Language::Python));
+        assert_eq!(h.focus, Focus::SubField(0));
     }
 
     #[test]
@@ -916,16 +1129,83 @@ mod tests {
     // --- Commit semantics ---
 
     #[test]
-    fn enter_on_subfield_commits_and_advances() {
+    fn enter_in_subfield_collapses_to_choice() {
+        // Enter inside the sub-menu confirms (collapses to choice) — the language
+        // stays checked. The user advances by navigating to "Next" and pressing Enter.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Right), &mut c);
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle ruff
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+        assert!(h.is_selected(Language::Python));
+        // Scratch retains the toggled tool even though commit hasn't happened yet.
+        assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
+    }
+
+    #[test]
+    fn full_flow_configure_and_advance() {
+        let mut h = with_cursor_on(Language::Python);
+        let mut c = ProjectConfig::default();
+        // Right on Python: check + expand
+        h.handle_input(key(KeyCode::Right), &mut c);
+        // Toggle a tool
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        // Enter to confirm sub-menu — collapse, stay on Python
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+        // Navigate up to "Next"
+        for _ in 0..20 {
+            h.handle_input(key(KeyCode::Up), &mut c);
+        }
+        assert_eq!(h.cursor, 0);
+        // Enter on Next: commit + advance
         let result = h.handle_input(key(KeyCode::Enter), &mut c);
         assert!(matches!(result, StepResult::Done));
         assert_eq!(c.language_configs.len(), 1);
         assert_eq!(c.language_configs[0].language, Language::Python);
         assert_eq!(c.language_configs[0].tools.len(), 1);
+    }
+
+    #[test]
+    fn confirm_button_collapses_via_enter() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        // Move to the Confirm row (last nav row)
+        let rows = h.current_nav_rows();
+        h.row_cursor = rows.len() - 1;
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+        assert!(h.is_selected(Language::Python));
+    }
+
+    #[test]
+    fn confirm_button_collapses_via_space() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let rows = h.current_nav_rows();
+        h.row_cursor = rows.len() - 1;
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn nav_rows_always_end_with_confirm() {
+        let python_rows = nav_rows(spec_for(Language::Python));
+        assert!(matches!(python_rows.last(), Some(NavRow::Confirm)));
+        let rust_rows = nav_rows(spec_for(Language::Rust));
+        assert!(matches!(rust_rows.last(), Some(NavRow::Confirm)));
+        let go_rows = nav_rows(spec_for(Language::Go));
+        // Empty-spec language: only the Confirm row.
+        assert_eq!(go_rows.len(), 1);
+        assert!(matches!(go_rows[0], NavRow::Confirm));
     }
 
     #[test]
@@ -948,16 +1228,18 @@ mod tests {
 
     #[test]
     fn uncheck_then_recheck_preserves_scratch() {
+        // Configure Python (toggle a tool), collapse, uncheck via Space,
+        // re-check via Space — scratch state should persist across the toggle.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
-        h.handle_input(key(KeyCode::Right), &mut c);
-        h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        h.handle_input(key(KeyCode::Esc), &mut c);
-        h.handle_input(key(KeyCode::Left), &mut c);
-        h.handle_input(key(KeyCode::Enter), &mut c); // uncheck
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle ruff
+        h.handle_input(key(KeyCode::Esc), &mut c); // back to choice
+        h.handle_input(key(KeyCode::Left), &mut c); // collapse
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // uncheck via Space
         assert!(!h.is_selected(Language::Python));
         assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
-        h.handle_input(key(KeyCode::Enter), &mut c); // re-check
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // re-check via Space
         assert!(h.is_selected(Language::Python));
         assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
     }
@@ -987,52 +1269,50 @@ mod tests {
         );
     }
 
-    // --- Empty-spec languages ---
+    // --- Empty-spec / unsupported languages ---
+    //
+    // After QA #5, unsupported languages are unselectable from the choice list,
+    // so the Right/Enter expansion paths no longer reach them via the keyboard.
+    // Direct setup tests still confirm the empty-spec rendering shape.
 
     #[test]
-    fn empty_spec_language_expands_but_has_no_nav_rows() {
-        let mut h = with_selected(Language::Go);
-        let mut c = ProjectConfig::default();
-        h.handle_input(key(KeyCode::Right), &mut c);
-        assert_eq!(h.expanded, Some(Language::Go));
-        assert_eq!(h.focus, Focus::SubField(0));
-        let rows = h.current_nav_rows();
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn empty_spec_esc_returns_to_choice() {
-        let mut h = with_selected(Language::Go);
-        let mut c = ProjectConfig::default();
-        h.handle_input(key(KeyCode::Right), &mut c);
-        h.handle_input(key(KeyCode::Esc), &mut c);
-        assert_eq!(h.focus, Focus::Choice);
+    fn empty_spec_has_only_confirm_row() {
+        let rows = nav_rows(spec_for(Language::Go));
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0], NavRow::Confirm));
     }
 
     // --- Tab cycling flattens 2D cursor ---
 
     #[test]
     fn tab_advances_linearly_through_columns_then_rows() {
+        // Python's first row is Linters with 3 tools (ruff, black, pylint).
+        // Cursor starts at (0, 0); Tab walks columns, then wraps to next row.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Right), &mut c);
-        h.handle_input(key(KeyCode::Tab), &mut c);
-        assert_eq!((h.row_cursor, h.col_cursor), (0, 1));
-        h.handle_input(key(KeyCode::Tab), &mut c);
-        assert_eq!((h.row_cursor, h.col_cursor), (0, 2));
+        let py_first_cat_cols = spec_for(Language::Python).categories[0].tools.len();
+        let mut col = 0usize;
+        for _ in 0..(py_first_cat_cols - 1) {
+            h.handle_input(key(KeyCode::Tab), &mut c);
+            col += 1;
+            assert_eq!((h.row_cursor, h.col_cursor), (0, col));
+        }
+        // Next Tab wraps to row 1, col 0
         h.handle_input(key(KeyCode::Tab), &mut c);
         assert_eq!((h.row_cursor, h.col_cursor), (1, 0));
     }
 
     #[test]
     fn backtab_moves_linearly_backward() {
+        // BackTab from (0, 0) wraps to the last position — which is the Confirm row.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Right), &mut c);
         h.handle_input(key(KeyCode::BackTab), &mut c);
-        let spec = spec_for(Language::Python);
-        let rows = nav_rows(spec);
+        let rows = nav_rows(spec_for(Language::Python));
         let last_row = rows.len() - 1;
+        assert!(matches!(rows[last_row], NavRow::Confirm));
         assert_eq!((h.row_cursor, h.col_cursor), (last_row, 0));
     }
 
@@ -1078,10 +1358,20 @@ mod tests {
     // --- helpers ---
 
     fn with_selected(lang: Language) -> LanguagesHandler {
+        // Cursor 0 is the "Next" pseudo-row; languages occupy 1..=12, so the
+        // language at VARIANTS index `i` lives at cursor `i + 1`.
         let idx = Language::VARIANTS.iter().position(|l| *l == lang).unwrap();
         LanguagesHandler {
-            cursor: idx,
+            cursor: idx + 1,
             selected: vec![lang],
+            ..Default::default()
+        }
+    }
+
+    fn with_cursor_on(lang: Language) -> LanguagesHandler {
+        let idx = Language::VARIANTS.iter().position(|l| *l == lang).unwrap();
+        LanguagesHandler {
+            cursor: idx + 1,
             ..Default::default()
         }
     }

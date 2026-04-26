@@ -15,6 +15,45 @@ use super::{Focus, StepHandler, StepResult, render_choice_line};
 
 const VCS_CHOICES: [Vcs; 3] = [Vcs::Git, Vcs::Jujutsu, Vcs::None];
 
+/// Returns `Some(reason)` if `name` violates basic git/jj branch-name rules,
+/// or `None` if it's acceptable. An empty string is treated as "use the VCS
+/// default" and considered valid. The check is conservative — it rejects the
+/// common mistakes (whitespace, double dots, leading slash) without trying to
+/// reproduce `git check-ref-format` exactly.
+pub(crate) fn branch_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return None;
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Some("Branch name cannot contain whitespace.");
+    }
+    if name.chars().any(char::is_control) {
+        return Some("Branch name cannot contain control characters.");
+    }
+    if name
+        .chars()
+        .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Some("Branch name contains a disallowed character.");
+    }
+    if name.contains("..") {
+        return Some("Branch name cannot contain '..'.");
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return Some("Branch name cannot start or end with '/'.");
+    }
+    if name.starts_with('.') {
+        return Some("Branch name cannot start with '.'.");
+    }
+    if name.ends_with(".lock") {
+        return Some("Branch name cannot end with '.lock'.");
+    }
+    if name == "@" {
+        return Some("Branch name cannot be '@'.");
+    }
+    None
+}
+
 #[derive(Debug)]
 pub struct VcsHandler {
     focus: Focus,
@@ -122,8 +161,33 @@ impl VcsHandler {
             constraints.push(Constraint::Length(3)); // default branch input
         }
         constraints.push(Constraint::Length(1)); // "None" label
-        constraints.push(Constraint::Min(1)); // spacer
+        constraints.push(Constraint::Length(1)); // spacer
+        constraints.push(Constraint::Length(1)); // validation line
+        constraints.push(Constraint::Min(0)); // remaining space
         constraints
+    }
+
+    /// True when the current default branch input is acceptable for the
+    /// expanded choice. Empty strings are acceptable (= "use VCS default").
+    /// Always true for choices that don't ask for a branch name.
+    fn branch_input_valid(&self) -> bool {
+        let needs_branch = matches!(self.expanded, Some(Vcs::Git))
+            || (self.expanded == Some(Vcs::Jujutsu) && self.jj_colocate);
+        if !needs_branch {
+            return true;
+        }
+        branch_name_problem(self.default_branch_input.value()).is_none()
+    }
+
+    /// Validation feedback for the current branch input. Returns an empty
+    /// string when there's nothing to flag.
+    fn validation_msg(&self) -> &'static str {
+        let needs_branch = matches!(self.expanded, Some(Vcs::Git))
+            || (self.expanded == Some(Vcs::Jujutsu) && self.jj_colocate);
+        if !needs_branch {
+            return "";
+        }
+        branch_name_problem(self.default_branch_input.value()).unwrap_or("")
     }
 
     fn handle_choice(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
@@ -223,6 +287,10 @@ impl VcsHandler {
                 return StepResult::Continue;
             }
             KeyCode::Enter => {
+                if !self.branch_input_valid() {
+                    // Keep focus where it is so the user can fix the branch name.
+                    return StepResult::Continue;
+                }
                 self.commit_to_config(config);
                 return StepResult::Done;
             }
@@ -309,6 +377,20 @@ impl StepHandler for VcsHandler {
         // None
         let highlighted = matches!(self.focus, Focus::Choice) && self.choice_cursor == 2;
         render_choice_line(frame, areas[idx], &Vcs::None, highlighted);
+        idx += 1;
+
+        // Spacer + validation line (always present in the layout for stable y-coords).
+        idx += 1; // spacer
+        if idx < areas.len() {
+            let msg = self.validation_msg();
+            if !msg.is_empty() {
+                let style = ratatui::style::Style::default().yellow();
+                frame.render_widget(
+                    Paragraph::new(Line::from(msg).style(style)),
+                    areas[idx],
+                );
+            }
+        }
     }
 
     fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
@@ -653,5 +735,102 @@ mod tests {
         let h = VcsHandler::default();
         let c = ProjectConfig::default();
         assert!(h.execute(&c).is_ok());
+    }
+
+    // --- branch_name_problem ---
+
+    #[test]
+    fn branch_name_empty_is_valid() {
+        // Empty means "use VCS default" — accepted.
+        assert!(branch_name_problem("").is_none());
+    }
+
+    #[test]
+    fn branch_name_with_space_is_invalid() {
+        assert!(branch_name_problem("my branch")
+            .unwrap()
+            .contains("whitespace"));
+    }
+
+    #[test]
+    fn branch_name_with_disallowed_chars_is_invalid() {
+        for c in ['~', '^', ':', '?', '*', '[', '\\'] {
+            assert!(
+                branch_name_problem(&format!("foo{c}bar")).is_some(),
+                "expected '{c}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_name_with_double_dot_is_invalid() {
+        assert!(branch_name_problem("foo..bar").is_some());
+    }
+
+    #[test]
+    fn branch_name_with_leading_or_trailing_slash_is_invalid() {
+        assert!(branch_name_problem("/main").is_some());
+        assert!(branch_name_problem("main/").is_some());
+    }
+
+    #[test]
+    fn branch_name_normal_names_are_valid() {
+        assert!(branch_name_problem("main").is_none());
+        assert!(branch_name_problem("develop").is_none());
+        assert!(branch_name_problem("feature/xyz").is_none());
+        assert!(branch_name_problem("v1.0").is_none());
+    }
+
+    // --- Invalid branch blocks Enter commit ---
+
+    #[test]
+    fn enter_with_invalid_branch_does_not_advance() {
+        let mut h = VcsHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Git; focus = SubField(0)
+        // Replace the default-branch input with a value containing a space.
+        h.default_branch_input = TextInput::new("Default branch").with_value("bad name");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(c.vcs.is_none(), "config should not be committed");
+    }
+
+    #[test]
+    fn enter_with_valid_branch_commits() {
+        let mut h = VcsHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Git
+        h.default_branch_input = TextInput::new("Default branch").with_value("trunk");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.vcs, Some(Vcs::Git));
+        assert_eq!(c.default_branch, "trunk");
+    }
+
+    #[test]
+    fn enter_with_empty_branch_commits() {
+        // Empty branch is valid (= use VCS default).
+        let mut h = VcsHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Git
+        h.default_branch_input = TextInput::new("Default branch");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.vcs, Some(Vcs::Git));
+        assert!(c.default_branch.is_empty());
+    }
+
+    #[test]
+    fn jujutsu_native_skips_branch_validation() {
+        // Native jj doesn't use the default-branch input, so a malformed value
+        // there shouldn't block commit.
+        let mut h = VcsHandler::default();
+        let mut c = ProjectConfig::default();
+        h.choice_cursor = 1;
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Jujutsu
+        h.jj_colocate = false; // native mode, branch unused
+        h.default_branch_input = TextInput::new("Default branch").with_value("bad name");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
     }
 }

@@ -128,6 +128,7 @@ pub enum Vcs {
     Git,
     #[strum(to_string = "Jujutsu (jj)")]
     Jujutsu,
+    #[strum(to_string = "Skip")]
     None,
 }
 
@@ -237,13 +238,19 @@ impl App {
                 instruction_spans.push(" Confirm ".into());
                 instruction_spans.push("<→/L> ".blue().bold());
             }
-            // Languages at Choice focus: Right/l expands (not confirm). At SubField
-            // focus it falls through to the generic "Next <Enter>" arm below.
+            // Languages at Choice focus: row 0 is "Next" (advance); rows 1..= are
+            // languages where Enter/→/L checks + expands the highlighted supported
+            // language (no-op on unsupported), Space toggles. SubField focus falls
+            // through to "Confirm <Enter>" below.
             WizardStep::Languages if !in_details => {
+                instruction_spans.push(" Select/Next ".into());
+                instruction_spans.push("<Enter/→/L> ".blue().bold());
                 instruction_spans.push(" Toggle ".into());
+                instruction_spans.push("<Space> ".blue().bold());
+            }
+            WizardStep::Languages if in_details => {
+                instruction_spans.push(" Confirm ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
-                instruction_spans.push(" Expand ".into());
-                instruction_spans.push("<→/L> ".blue().bold());
             }
             WizardStep::Summary => {
                 instruction_spans.push(" Confirm ".into());
@@ -259,6 +266,10 @@ impl App {
                 instruction_spans.push(" Next ".into());
                 instruction_spans.push("<Enter/→/L> ".blue().bold());
             }
+        }
+        if !matches!(self.current_step(), WizardStep::Summary) {
+            instruction_spans.push(" Navigate ".into());
+            instruction_spans.push("<↑/K/↓/J> ".blue().bold());
         }
         instruction_spans.push(" Peek ".into());
         instruction_spans.push("<Shift+←/→> ".blue().bold());
@@ -437,7 +448,7 @@ impl App {
                     }
                 }
                 if !deps.is_empty() {
-                    lines.push(format!("    Deps: {}", deps.join(", ")));
+                    lines.push(format!("    Dependencies: {}", deps.join(", ")));
                 }
             }
         }
@@ -761,7 +772,7 @@ mod tests {
     fn vcs_display() {
         assert_eq!(Vcs::Git.to_string(), "Git");
         assert_eq!(Vcs::Jujutsu.to_string(), "Jujutsu (jj)");
-        assert_eq!(Vcs::None.to_string(), "None");
+        assert_eq!(Vcs::None.to_string(), "Skip");
     }
 
     #[test]
@@ -990,7 +1001,7 @@ mod tests {
         let summary = app.config_summary();
         assert!(summary.contains("Python:"));
         assert!(summary.contains("Tools: ruff, pytest"));
-        assert!(summary.contains("Deps: fastapi, my-lib"));
+        assert!(summary.contains("Dependencies: fastapi, my-lib"));
         assert!(summary.contains("CI: GitHub Actions"));
         assert!(summary.contains("Pre-commit: pre-commit"));
     }

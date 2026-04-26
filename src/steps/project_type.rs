@@ -25,6 +25,26 @@ enum TypeChoice {
 
 const TYPE_CHOICES: [TypeChoice; 2] = [TypeChoice::New, TypeChoice::Existing];
 
+/// Returns `Some(reason)` if `name` is not a valid project (directory) name,
+/// or `None` if it's acceptable. Disallows empty strings, path separators,
+/// `.` / `..`, and control characters — all of which would either fail the
+/// directory creation outright or produce a path that surprises the user.
+fn project_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("Project name is required.");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("Project name cannot contain '/' or '\\'.");
+    }
+    if name == "." || name == ".." {
+        return Some("Project name cannot be '.' or '..'.");
+    }
+    if name.chars().any(char::is_control) {
+        return Some("Project name contains invalid control characters.");
+    }
+    None
+}
+
 impl std::fmt::Debug for ProjectTypeHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProjectTypeHandler")
@@ -118,8 +138,8 @@ impl ProjectTypeHandler {
             TypeChoice::New => {
                 let name = self.name_input.value();
                 let location = self.location_input.value();
-                if name.is_empty() {
-                    self.validation_msg = "Project name is required.".to_string();
+                if let Some(msg) = project_name_problem(name) {
+                    self.validation_msg = msg.to_string();
                 } else if path.exists() {
                     self.validation_msg =
                         format!("Warning: {} already exists.", path.display());
@@ -150,7 +170,7 @@ impl ProjectTypeHandler {
         };
         match choice {
             TypeChoice::New => {
-                !self.name_input.value().is_empty()
+                project_name_problem(self.name_input.value()).is_none()
                     && !self.full_path().exists()
                     && PathBuf::from(self.location_input.value()).exists()
             }
@@ -862,6 +882,52 @@ mod tests {
         };
         h.validate();
         assert!(h.validation_msg.contains("required"));
+    }
+
+    // --- project_name_problem unit tests ---
+
+    #[test]
+    fn project_name_empty_is_invalid() {
+        assert!(project_name_problem("").unwrap().contains("required"));
+    }
+
+    #[test]
+    fn project_name_with_slash_is_invalid() {
+        assert!(project_name_problem("////////").unwrap().contains('/'));
+        assert!(project_name_problem("foo/bar").unwrap().contains('/'));
+        assert!(project_name_problem("foo\\bar").is_some());
+    }
+
+    #[test]
+    fn project_name_dot_or_dotdot_is_invalid() {
+        assert!(project_name_problem(".").is_some());
+        assert!(project_name_problem("..").is_some());
+    }
+
+    #[test]
+    fn project_name_with_control_char_is_invalid() {
+        assert!(project_name_problem("foo\nbar").is_some());
+        assert!(project_name_problem("foo\tbar").is_some());
+    }
+
+    #[test]
+    fn project_name_normal_names_are_valid() {
+        assert!(project_name_problem("myproj").is_none());
+        assert!(project_name_problem("my-project_2").is_none());
+        assert!(project_name_problem(".hidden").is_none()); // leading dot is fine
+    }
+
+    #[test]
+    fn validate_new_rejects_invalid_name_chars() {
+        let mut h = ProjectTypeHandler {
+            expanded: Some(TypeChoice::New),
+            name_input: TextInput::new("Name").with_value("////////"),
+            location_input: TextInput::new("Location").with_value("/tmp"),
+            ..Default::default()
+        };
+        h.validate();
+        assert!(h.validation_msg.contains('/'));
+        assert!(!h.is_valid());
     }
 
     #[test]
