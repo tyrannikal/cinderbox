@@ -268,10 +268,12 @@ impl LanguagesHandler {
                 StepResult::Continue
             }
             KeyCode::Char(' ') => {
-                // Space toggles the language under the cursor (only on supported langs).
-                // Has no effect on the "Next" pseudo-row or unsupported languages.
+                // Space deselects an already-checked language without expanding it.
+                // No-op on the Next pseudo-row, unsupported languages, or unchecked
+                // languages — checking + expanding is Enter's job.
                 if let Some(lang) = self.cursor_lang()
                     && is_supported(lang)
+                    && self.is_selected(lang)
                 {
                     self.toggle_lang(lang);
                 }
@@ -360,21 +362,14 @@ impl LanguagesHandler {
                 self.advance_flattened(&rows, spec, true);
                 return StepResult::Continue;
             }
-            KeyCode::Enter => {
-                // Enter inside the sub-menu always confirms — collapse and return
-                // focus to the choice list. The language stays checked; the user
-                // advances to the next step from the "Next" pseudo-row at the top.
-                self.collapse_persist();
-                return StepResult::Continue;
-            }
             _ => {}
         }
 
-        // Confirm-button row: Space also collapses; horizontal nav is a no-op.
+        // Confirm-button row: Enter and Space both collapse; horizontal nav is a no-op.
         if on_confirm {
             match key.code {
                 KeyCode::Char('q') => return StepResult::Quit,
-                KeyCode::Char(' ') => {
+                KeyCode::Char(' ') | KeyCode::Enter => {
                     self.collapse_persist();
                 }
                 KeyCode::Char('k') => {
@@ -399,6 +394,13 @@ impl LanguagesHandler {
 
         // Row-kind-specific handling.
         if on_text {
+            // Enter on the text input row collapses the sub-panel — Space here
+            // inserts a literal space (via the Char(c) arm), so Enter is the
+            // only "confirm without leaving the input" key.
+            if matches!(key.code, KeyCode::Enter) {
+                self.collapse_persist();
+                return StepResult::Continue;
+            }
             match key.code {
                 KeyCode::Char(c) => {
                     self.custom_deps_input.handle_input(KeyCode::Char(c));
@@ -446,7 +448,7 @@ impl LanguagesHandler {
                     self.col_cursor += 1;
                 }
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') | KeyCode::Enter => {
                 self.toggle_focused_checkbox();
             }
             _ => {}
@@ -921,13 +923,31 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_supported_lang() {
+    fn space_deselects_checked_lang() {
+        // Space at choice level deselects only — no-op on unchecked languages,
+        // unchecks already-selected languages without expanding them.
+        let mut h = with_selected(Language::Rust);
+        let mut c = ProjectConfig::default();
+        // Cursor is on Rust (with_selected places it there).
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(h.selected.is_empty());
+        assert!(h.expanded.is_none());
+        // Pressing Space again on the now-unchecked language is a no-op
+        // (Space is deselect-only — it does not check).
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(h.selected.is_empty());
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn space_on_unchecked_lang_is_noop() {
+        // Space on an unchecked supported language does NOT check it — that's
+        // Enter's job. Space only deselects.
         let mut h = with_cursor_on(Language::Rust);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert_eq!(h.selected, vec![Language::Rust]);
-        h.handle_input(key(KeyCode::Char(' ')), &mut c);
         assert!(h.selected.is_empty());
+        assert!(h.expanded.is_none());
     }
 
     #[test]
@@ -1129,31 +1149,64 @@ mod tests {
     // --- Commit semantics ---
 
     #[test]
-    fn enter_in_subfield_collapses_to_choice() {
-        // Enter inside the sub-menu confirms (collapses to choice) — the language
-        // stays checked. The user advances by navigating to "Next" and pressing Enter.
+    fn enter_on_subfield_checkbox_toggles() {
+        // Enter at sub-level acts like Space on each row: on a checkbox row it
+        // toggles the focused checkbox (does NOT collapse).
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand, focus on first tool row
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        // Focus stays in sub-panel; the checkbox is toggled on.
+        assert_eq!(h.focus, Focus::SubField(0));
+        assert_eq!(h.expanded, Some(Language::Python));
+        assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
+        // Pressing Enter again toggles it back off.
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(h.scratch_for(Language::Python).unwrap().tools.is_empty());
+    }
+
+    #[test]
+    fn enter_on_text_input_row_collapses() {
+        // Option 3: Enter on the custom-deps text input row collapses, since
+        // Space there inserts a literal space character. This preserves a way
+        // to confirm without first navigating away from a half-typed dep.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Right), &mut c);
-        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle ruff
+        let spec = spec_for(Language::Python);
+        let rows = nav_rows(spec);
+        let text_row = rows
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .expect("custom deps row exists");
+        h.row_cursor = text_row;
+        h.col_cursor = 0;
+        for ch in "my-lib".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
         let result = h.handle_input(key(KeyCode::Enter), &mut c);
         assert!(matches!(result, StepResult::Continue));
         assert_eq!(h.focus, Focus::Choice);
         assert!(h.expanded.is_none());
-        assert!(h.is_selected(Language::Python));
-        // Scratch retains the toggled tool even though commit hasn't happened yet.
-        assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
+        // The half-typed dep is persisted into scratch.
+        assert_eq!(
+            h.scratch_for(Language::Python).unwrap().custom_deps,
+            "my-lib"
+        );
     }
 
     #[test]
     fn full_flow_configure_and_advance() {
         let mut h = with_cursor_on(Language::Python);
         let mut c = ProjectConfig::default();
-        // Right on Python: check + expand
-        h.handle_input(key(KeyCode::Right), &mut c);
-        // Toggle a tool
+        // Enter on Python: check + expand
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        // Toggle a tool with Space
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        // Enter to confirm sub-menu — collapse, stay on Python
+        // Navigate to the Confirm row and press Enter to collapse.
+        let rows = h.current_nav_rows();
+        h.row_cursor = rows.len() - 1;
         h.handle_input(key(KeyCode::Enter), &mut c);
         assert_eq!(h.focus, Focus::Choice);
         // Navigate up to "Next"
@@ -1229,17 +1282,17 @@ mod tests {
     #[test]
     fn uncheck_then_recheck_preserves_scratch() {
         // Configure Python (toggle a tool), collapse, uncheck via Space,
-        // re-check via Space — scratch state should persist across the toggle.
+        // re-check via Enter — scratch state should persist across the toggle.
         let mut h = with_selected(Language::Python);
         let mut c = ProjectConfig::default();
         h.handle_input(key(KeyCode::Right), &mut c); // expand
-        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle ruff
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle ruff (sub-level)
         h.handle_input(key(KeyCode::Esc), &mut c); // back to choice
         h.handle_input(key(KeyCode::Left), &mut c); // collapse
         h.handle_input(key(KeyCode::Char(' ')), &mut c); // uncheck via Space
         assert!(!h.is_selected(Language::Python));
         assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
-        h.handle_input(key(KeyCode::Char(' ')), &mut c); // re-check via Space
+        h.handle_input(key(KeyCode::Enter), &mut c); // re-check via Enter (also expands)
         assert!(h.is_selected(Language::Python));
         assert_eq!(h.scratch_for(Language::Python).unwrap().tools.len(), 1);
     }

@@ -26,21 +26,27 @@ enum TypeChoice {
 const TYPE_CHOICES: [TypeChoice; 2] = [TypeChoice::New, TypeChoice::Existing];
 
 /// Returns `Some(reason)` if `name` is not a valid project (directory) name,
-/// or `None` if it's acceptable. Disallows empty strings, path separators,
-/// `.` / `..`, and control characters — all of which would either fail the
-/// directory creation outright or produce a path that surprises the user.
+/// or `None` if it's acceptable. Whitelist per `sanitizing user input/filenames.md`:
+/// POSIX portable filename character set (A–Z, a–z, 0–9, `.`, `_`, `-`), non-empty,
+/// not `.` or `..`, no leading dash, ≤255 bytes.
 fn project_name_problem(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("Project name is required.");
     }
-    if name.contains('/') || name.contains('\\') {
-        return Some("Project name cannot contain '/' or '\\'.");
-    }
     if name == "." || name == ".." {
         return Some("Project name cannot be '.' or '..'.");
     }
-    if name.chars().any(char::is_control) {
-        return Some("Project name contains invalid control characters.");
+    if name.starts_with('-') {
+        return Some("Project name cannot start with '-'.");
+    }
+    if name.len() > 255 {
+        return Some("Project name is too long (255 byte max).");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Some("Project name may only contain A-Z, a-z, 0-9, '.', '_', '-'.");
     }
     None
 }
@@ -895,22 +901,93 @@ mod tests {
     }
 
     #[test]
-    fn project_name_with_slash_is_invalid() {
-        assert!(project_name_problem("////////").unwrap().contains('/'));
-        assert!(project_name_problem("foo/bar").unwrap().contains('/'));
-        assert!(project_name_problem("foo\\bar").is_some());
-    }
-
-    #[test]
     fn project_name_dot_or_dotdot_is_invalid() {
-        assert!(project_name_problem(".").is_some());
-        assert!(project_name_problem("..").is_some());
+        assert!(
+            project_name_problem(".")
+                .unwrap()
+                .contains("'.' or '..'")
+        );
+        assert!(
+            project_name_problem("..")
+                .unwrap()
+                .contains("'.' or '..'")
+        );
     }
 
     #[test]
-    fn project_name_with_control_char_is_invalid() {
-        assert!(project_name_problem("foo\nbar").is_some());
-        assert!(project_name_problem("foo\tbar").is_some());
+    fn project_name_with_leading_dash_is_invalid() {
+        assert!(
+            project_name_problem("-project")
+                .unwrap()
+                .contains("start with '-'")
+        );
+        assert!(project_name_problem("-").unwrap().contains("start with '-'"));
+    }
+
+    #[test]
+    fn project_name_too_long_is_invalid() {
+        let n = "a".repeat(256);
+        assert!(project_name_problem(&n).unwrap().contains("too long"));
+    }
+
+    #[test]
+    fn project_name_at_byte_limit_is_valid() {
+        let n = "a".repeat(255);
+        assert!(project_name_problem(&n).is_none());
+    }
+
+    #[test]
+    fn project_name_outside_whitelist_is_invalid() {
+        // path separators
+        assert!(
+            project_name_problem("foo/bar")
+                .unwrap()
+                .contains("may only contain")
+        );
+        assert!(
+            project_name_problem("foo\\bar")
+                .unwrap()
+                .contains("may only contain")
+        );
+        // spaces
+        assert!(
+            project_name_problem("my project")
+                .unwrap()
+                .contains("may only contain")
+        );
+        // unicode
+        assert!(
+            project_name_problem("café")
+                .unwrap()
+                .contains("may only contain")
+        );
+        assert!(
+            project_name_problem("日本語")
+                .unwrap()
+                .contains("may only contain")
+        );
+        // common punctuation
+        assert!(
+            project_name_problem("app+v2")
+                .unwrap()
+                .contains("may only contain")
+        );
+        assert!(
+            project_name_problem("tool(test)")
+                .unwrap()
+                .contains("may only contain")
+        );
+        // control chars
+        assert!(
+            project_name_problem("foo\nbar")
+                .unwrap()
+                .contains("may only contain")
+        );
+        assert!(
+            project_name_problem("foo\tbar")
+                .unwrap()
+                .contains("may only contain")
+        );
     }
 
     #[test]
@@ -918,6 +995,8 @@ mod tests {
         assert!(project_name_problem("myproj").is_none());
         assert!(project_name_problem("my-project_2").is_none());
         assert!(project_name_problem(".hidden").is_none()); // leading dot is fine
+        assert!(project_name_problem("web_tool_v2").is_none());
+        assert!(project_name_problem("cool-project").is_none());
     }
 
     #[test]
@@ -929,7 +1008,6 @@ mod tests {
             ..Default::default()
         };
         h.validate();
-        assert!(h.validation_msg.contains('/'));
         assert!(!h.is_valid());
     }
 

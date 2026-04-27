@@ -19,7 +19,8 @@ const VCS_CHOICES: [Vcs; 3] = [Vcs::Git, Vcs::Jujutsu, Vcs::None];
 /// or `None` if it's acceptable. An empty string is treated as "use the VCS
 /// default" and considered valid. The check is conservative — it rejects the
 /// common mistakes (whitespace, double dots, leading slash) without trying to
-/// reproduce `git check-ref-format` exactly.
+/// reproduce `git check-ref-format` exactly. Used for git and for colocated jj
+/// (where bookmarks ARE git branches).
 pub(crate) fn branch_name_problem(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return None;
@@ -50,6 +51,38 @@ pub(crate) fn branch_name_problem(name: &str) -> Option<&'static str> {
     }
     if name == "@" {
         return Some("Branch name cannot be '@'.");
+    }
+    None
+}
+
+/// Returns `Some(reason)` if `name` is not an acceptable jj bookmark name for
+/// **native (non-colocated) jj**, or `None` if it's acceptable. Whitelist per
+/// `sanitizing user input/branch-names.md`: POSIX portable filename charset
+/// plus `/` for namespacing. Empty string = "use jj default" (valid).
+pub(crate) fn jj_bookmark_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return None;
+    }
+    if name == "." || name == ".." {
+        return Some("Bookmark name cannot be '.' or '..'.");
+    }
+    if name.starts_with('-') {
+        return Some("Bookmark name cannot start with '-'.");
+    }
+    if name.starts_with('.') {
+        return Some("Bookmark name cannot start with '.'.");
+    }
+    if name.starts_with('/') || name.ends_with('/') {
+        return Some("Bookmark name cannot start or end with '/'.");
+    }
+    if name.contains("..") {
+        return Some("Bookmark name cannot contain '..'.");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-' || b == b'/')
+    {
+        return Some("Bookmark name may only contain A-Z, a-z, 0-9, '.', '_', '-', '/'.");
     }
     None
 }
@@ -167,27 +200,31 @@ impl VcsHandler {
         constraints
     }
 
+    /// Dispatches the branch/bookmark validator for the current choice +
+    /// colocation mode. Git and colocated jj use git ref-name rules; native
+    /// jj uses the more permissive POSIX-portable + `/` whitelist. None has
+    /// no input to validate.
+    fn branch_input_problem(&self) -> Option<&'static str> {
+        let value = self.default_branch_input.value();
+        match self.expanded {
+            Some(Vcs::Git) => branch_name_problem(value),
+            Some(Vcs::Jujutsu) if self.jj_colocate => branch_name_problem(value),
+            Some(Vcs::Jujutsu) => jj_bookmark_problem(value),
+            _ => None,
+        }
+    }
+
     /// True when the current default branch input is acceptable for the
     /// expanded choice. Empty strings are acceptable (= "use VCS default").
     /// Always true for choices that don't ask for a branch name.
     fn branch_input_valid(&self) -> bool {
-        let needs_branch = matches!(self.expanded, Some(Vcs::Git))
-            || (self.expanded == Some(Vcs::Jujutsu) && self.jj_colocate);
-        if !needs_branch {
-            return true;
-        }
-        branch_name_problem(self.default_branch_input.value()).is_none()
+        self.branch_input_problem().is_none()
     }
 
     /// Validation feedback for the current branch input. Returns an empty
     /// string when there's nothing to flag.
     fn validation_msg(&self) -> &'static str {
-        let needs_branch = matches!(self.expanded, Some(Vcs::Git))
-            || (self.expanded == Some(Vcs::Jujutsu) && self.jj_colocate);
-        if !needs_branch {
-            return "";
-        }
-        branch_name_problem(self.default_branch_input.value()).unwrap_or("")
+        self.branch_input_problem().unwrap_or("")
     }
 
     fn handle_choice(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
@@ -820,17 +857,158 @@ mod tests {
         assert!(c.default_branch.is_empty());
     }
 
+    // --- jj_bookmark_problem (native jj) ---
+
     #[test]
-    fn jujutsu_native_skips_branch_validation() {
-        // Native jj doesn't use the default-branch input, so a malformed value
-        // there shouldn't block commit.
+    fn jj_bookmark_empty_is_valid() {
+        // Empty means "use jj default" — accepted.
+        assert!(jj_bookmark_problem("").is_none());
+    }
+
+    #[test]
+    fn jj_bookmark_dot_or_dotdot_is_invalid() {
+        assert!(
+            jj_bookmark_problem(".")
+                .unwrap()
+                .contains("'.' or '..'")
+        );
+        assert!(
+            jj_bookmark_problem("..")
+                .unwrap()
+                .contains("'.' or '..'")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_leading_dash_is_invalid() {
+        assert!(
+            jj_bookmark_problem("-trunk")
+                .unwrap()
+                .contains("start with '-'")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_leading_dot_is_invalid() {
+        assert!(
+            jj_bookmark_problem(".hidden")
+                .unwrap()
+                .contains("start with '.'")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_leading_or_trailing_slash_is_invalid() {
+        assert!(
+            jj_bookmark_problem("/main")
+                .unwrap()
+                .contains("start or end with '/'")
+        );
+        assert!(
+            jj_bookmark_problem("main/")
+                .unwrap()
+                .contains("start or end with '/'")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_double_dot_is_invalid() {
+        assert!(
+            jj_bookmark_problem("foo..bar")
+                .unwrap()
+                .contains("'..'")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_outside_whitelist_is_invalid() {
+        // chars git also rejects
+        for c in ['~', '^', ':', '?', '*', '[', '\\', '+', '@'] {
+            assert!(
+                jj_bookmark_problem(&format!("foo{c}bar"))
+                    .unwrap()
+                    .contains("may only contain"),
+                "expected '{c}' to be rejected"
+            );
+        }
+        // whitespace and unicode
+        assert!(
+            jj_bookmark_problem("my bookmark")
+                .unwrap()
+                .contains("may only contain")
+        );
+        assert!(
+            jj_bookmark_problem("café")
+                .unwrap()
+                .contains("may only contain")
+        );
+        // control char
+        assert!(
+            jj_bookmark_problem("foo\nbar")
+                .unwrap()
+                .contains("may only contain")
+        );
+    }
+
+    #[test]
+    fn jj_bookmark_normal_names_are_valid() {
+        assert!(jj_bookmark_problem("main").is_none());
+        assert!(jj_bookmark_problem("develop").is_none());
+        assert!(jj_bookmark_problem("feature/xyz").is_none());
+        assert!(jj_bookmark_problem("v1.0").is_none());
+        assert!(jj_bookmark_problem("user/jdoe/topic").is_none());
+    }
+
+    // --- Native jj enforces bookmark validation ---
+
+    #[test]
+    fn enter_with_invalid_bookmark_in_native_jj_does_not_advance() {
         let mut h = VcsHandler::default();
         let mut c = ProjectConfig::default();
         h.choice_cursor = 1;
         h.handle_input(key(KeyCode::Enter), &mut c); // expand Jujutsu
-        h.jj_colocate = false; // native mode, branch unused
+        h.jj_colocate = false;
         h.default_branch_input = TextInput::new("Default branch").with_value("bad name");
         let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(c.vcs.is_none(), "config should not be committed");
+    }
+
+    #[test]
+    fn enter_with_valid_bookmark_in_native_jj_commits() {
+        let mut h = VcsHandler::default();
+        let mut c = ProjectConfig::default();
+        h.choice_cursor = 1;
+        h.handle_input(key(KeyCode::Enter), &mut c); // expand Jujutsu
+        h.jj_colocate = false;
+        h.default_branch_input = TextInput::new("Default branch").with_value("trunk");
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
         assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.vcs, Some(Vcs::Jujutsu));
+        assert_eq!(c.default_branch, "trunk");
+        assert!(!c.jj_colocate);
+    }
+
+    #[test]
+    fn colocate_toggle_switches_validator() {
+        // The git rules reject `@` (bare); the jj-bookmark whitelist also
+        // rejects `@` (not in charset). Pick a name that's accepted by git
+        // rules but rejected by the jj whitelist: `feature+v2` — git allows
+        // `+`, the POSIX-portable whitelist does not.
+        let h = VcsHandler {
+            expanded: Some(Vcs::Jujutsu),
+            jj_colocate: true,
+            default_branch_input: TextInput::new("Default branch").with_value("feature+v2"),
+            ..Default::default()
+        };
+        assert!(h.branch_input_valid(), "git rules accept '+'");
+
+        let h = VcsHandler {
+            expanded: Some(Vcs::Jujutsu),
+            jj_colocate: false,
+            default_branch_input: TextInput::new("Default branch").with_value("feature+v2"),
+            ..Default::default()
+        };
+        assert!(!h.branch_input_valid(), "jj whitelist rejects '+'");
     }
 }
