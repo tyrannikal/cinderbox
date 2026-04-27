@@ -258,10 +258,13 @@ impl ProjectTypeHandler {
 
     fn render_validation(&self, frame: &mut Frame, area: Rect) {
         if !self.validation_msg.is_empty() {
-            let style = if self.validation_msg.starts_with("Warning") {
-                ratatui::style::Style::default().yellow()
-            } else {
+            // Success previews ("Will create:" / "Will use:") render green; everything
+            // else — invalid-name errors, missing-location errors, "Warning: …"
+            // notices — renders yellow to match the VCS step's validation styling.
+            let style = if self.validation_msg.starts_with("Will ") {
                 ratatui::style::Style::default().green()
+            } else {
+                ratatui::style::Style::default().yellow()
             };
             frame.render_widget(
                 Paragraph::new(Line::from(self.validation_msg.as_str()).style(style)),
