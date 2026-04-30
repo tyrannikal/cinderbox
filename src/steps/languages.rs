@@ -28,6 +28,80 @@ fn is_supported(lang: Language) -> bool {
     !spec.categories.is_empty() || !spec.common_deps.is_empty()
 }
 
+/// Validates a single (already-trimmed, non-empty) dependency token under
+/// `lang`'s ecosystem rules. Returns a short rule description for invalid
+/// tokens. Languages without a registry spec accept anything (they're
+/// unreachable through the normal flow anyway).
+///
+/// Rules:
+/// - **Python** (PEP 503/508 distribution name): only `[A-Za-z0-9._-]`,
+///   must start and end with an alphanumeric.
+/// - **Rust** (Cargo crate name): `[a-zA-Z][a-zA-Z0-9_-]*`, ≤64 characters.
+fn dep_problem(lang: Language, token: &str) -> Option<&'static str> {
+    match lang {
+        Language::Python => dep_problem_python(token),
+        Language::Rust => dep_problem_rust(token),
+        _ => None,
+    }
+}
+
+fn dep_problem_python(token: &str) -> Option<&'static str> {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() {
+        return Some("empty name");
+    }
+    if !bytes[0].is_ascii_alphanumeric() {
+        return Some("must start with a letter or digit");
+    }
+    if !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
+        return Some("must end with a letter or digit");
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Some("only letters, digits, '.', '_', '-' allowed");
+    }
+    None
+}
+
+fn dep_problem_rust(token: &str) -> Option<&'static str> {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() {
+        return Some("empty name");
+    }
+    if bytes.len() > 64 {
+        return Some("must be ≤64 characters");
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return Some("must start with a letter");
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return Some("only letters, digits, '_', '-' allowed");
+    }
+    None
+}
+
+/// Validates the entire comma-separated custom-deps string. Empty / whitespace-only
+/// tokens (e.g. trailing commas) are silently skipped — only present tokens
+/// are checked. Returns a formatted message naming the first offending token
+/// and the rule it broke.
+fn custom_deps_problem(lang: Language, raw: &str) -> Option<String> {
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rule) = dep_problem(lang, trimmed) {
+            return Some(format!("Invalid {lang} dep \"{trimmed}\": {rule}"));
+        }
+    }
+    None
+}
+
 /// One interactive row inside an expanded language's sub-panel.
 /// Drives the handler's 2D cursor (row_cursor × col_cursor) and the render walk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -237,6 +311,29 @@ impl LanguagesHandler {
             .is_some_and(|lc| lc.common_deps.contains(&dep.id))
     }
 
+    /// Live custom_deps problem for the currently-expanded language. Backs the
+    /// inline yellow warning under the input and the Confirm-button block.
+    fn live_deps_problem(&self) -> Option<String> {
+        let lang = self.expanded?;
+        custom_deps_problem(lang, self.custom_deps_input.value())
+    }
+
+    /// First selected language with an invalid custom_deps scratch value.
+    /// Backs the choice-level warning and the Next-block gate. Reads scratch
+    /// (which is kept in sync with the live input on every keystroke).
+    fn selected_deps_problem(&self) -> Option<String> {
+        for lang in &self.selected {
+            let raw = self
+                .scratch_for(*lang)
+                .map(|lc| lc.custom_deps.as_str())
+                .unwrap_or("");
+            if let Some(msg) = custom_deps_problem(*lang, raw) {
+                return Some(msg);
+            }
+        }
+        None
+    }
+
     // --- Input handling ---
 
     /// Total choice-row count: the "Next" pseudo-row plus one row per language.
@@ -282,6 +379,11 @@ impl LanguagesHandler {
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match self.cursor_lang() {
                 None => {
                     // "Next" — commit current selections (possibly empty) and advance.
+                    // Blocked when any selected language has invalid custom_deps;
+                    // the choice-level yellow warning explains why.
+                    if self.selected_deps_problem().is_some() {
+                        return StepResult::Continue;
+                    }
                     self.commit_to_config(config);
                     StepResult::Done
                 }
@@ -370,7 +472,11 @@ impl LanguagesHandler {
             match key.code {
                 KeyCode::Char('q') => return StepResult::Quit,
                 KeyCode::Char(' ') | KeyCode::Enter => {
-                    self.collapse_persist();
+                    // Blocked when the live custom_deps input is invalid; the
+                    // inline yellow warning under the input explains why.
+                    if self.live_deps_problem().is_none() {
+                        self.collapse_persist();
+                    }
                 }
                 KeyCode::Char('k') => {
                     if self.row_cursor == 0 {
@@ -664,6 +770,23 @@ impl LanguagesHandler {
         }
         nav_row_idx += 1;
 
+        // Inline validation warning for the live custom_deps input.
+        if let Some(msg) = self.live_deps_problem()
+            && y < bottom
+        {
+            let rect = Rect {
+                x: area.x + INDENT_ROW,
+                y,
+                width: area.width.saturating_sub(INDENT_ROW),
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(format!("⚠  {msg}")).style(Style::default().fg(Color::Yellow))),
+                rect,
+            );
+            y += 1;
+        }
+
         // Confirm button at the bottom of the sub-panel.
         y = self.render_confirm_at(frame, area, y, bottom, nav_row_idx);
         y
@@ -789,6 +912,27 @@ impl StepHandler for LanguagesHandler {
                 };
                 y = self.render_expanded_panel(frame, *lang, panel_area);
             }
+        }
+
+        // Choice-level warning: any selected language with invalid custom_deps
+        // blocks the Next row. Render after the choice list so it sits at the
+        // tail regardless of which language is expanded.
+        if let Some(msg) = self.selected_deps_problem()
+            && y < bottom
+        {
+            let rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from(format!("⚠  Cannot advance: {msg}"))
+                        .style(Style::default().fg(Color::Yellow)),
+                ),
+                rect,
+            );
         }
     }
 
@@ -1406,6 +1550,179 @@ mod tests {
         let h = LanguagesHandler::default();
         let c = ProjectConfig::default();
         assert!(h.execute(&c).is_ok());
+    }
+
+    // --- custom_deps validation rules ---
+
+    #[test]
+    fn dep_problem_python_accepts_pep503_names() {
+        for name in ["fastapi", "pandas", "numpy", "Django", "SQLAlchemy", "pillow", "py.test", "back-port", "x"] {
+            assert!(dep_problem(Language::Python, name).is_none(), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn dep_problem_python_rejects_bad_chars_and_edges() {
+        assert!(dep_problem(Language::Python, "").is_some());
+        assert!(dep_problem(Language::Python, "-leading-dash").is_some());
+        assert!(dep_problem(Language::Python, "trailing-").is_some());
+        assert!(dep_problem(Language::Python, "has space").is_some());
+        assert!(dep_problem(Language::Python, "weird@name").is_some());
+        assert!(dep_problem(Language::Python, ".dotfile").is_some());
+    }
+
+    #[test]
+    fn dep_problem_rust_accepts_cargo_names() {
+        for name in ["serde", "tokio", "anyhow", "clap", "serde_json", "winit-x11", "x"] {
+            assert!(dep_problem(Language::Rust, name).is_none(), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn dep_problem_rust_rejects_bad_starts_and_chars() {
+        assert!(dep_problem(Language::Rust, "").is_some());
+        assert!(dep_problem(Language::Rust, "1abc").is_some(), "leading digit forbidden");
+        assert!(dep_problem(Language::Rust, "_leading_underscore").is_some());
+        assert!(dep_problem(Language::Rust, "has space").is_some());
+        assert!(dep_problem(Language::Rust, "with.dot").is_some(), "Cargo names disallow '.'");
+        assert!(dep_problem(Language::Rust, &"a".repeat(65)).is_some(), "65 chars exceeds cap");
+        assert!(dep_problem(Language::Rust, &"a".repeat(64)).is_none(), "64 chars at the cap");
+    }
+
+    #[test]
+    fn custom_deps_problem_skips_empty_tokens() {
+        // Trailing comma, double comma, surrounding whitespace — all silently skipped.
+        assert!(custom_deps_problem(Language::Python, "fastapi,").is_none());
+        assert!(custom_deps_problem(Language::Python, ",fastapi").is_none());
+        assert!(custom_deps_problem(Language::Python, "fastapi,,pandas").is_none());
+        assert!(custom_deps_problem(Language::Python, "  fastapi , pandas  ").is_none());
+    }
+
+    #[test]
+    fn custom_deps_problem_returns_first_offender() {
+        let msg = custom_deps_problem(Language::Python, "fastapi, bad name, pandas")
+            .expect("bad name should be flagged");
+        assert!(msg.contains("\"bad name\""), "msg should name the bad token: {msg}");
+        assert!(msg.contains("Python"), "msg should name the language: {msg}");
+    }
+
+    #[test]
+    fn custom_deps_problem_empty_input_is_valid() {
+        assert!(custom_deps_problem(Language::Python, "").is_none());
+        assert!(custom_deps_problem(Language::Rust, "   ").is_none());
+        assert!(custom_deps_problem(Language::Python, ",,").is_none());
+    }
+
+    // --- gating behavior: Confirm + Next ---
+
+    #[test]
+    fn confirm_button_blocked_with_invalid_custom_deps() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        // Type an invalid dep into the input.
+        let text_row = nav_rows(spec_for(Language::Python))
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .unwrap();
+        h.row_cursor = text_row;
+        for ch in "bad name".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        // Move to Confirm and press Enter — should be blocked.
+        let rows = h.current_nav_rows();
+        h.row_cursor = rows.len() - 1;
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.expanded, Some(Language::Python), "Confirm should not collapse");
+        // Space on Confirm should also be blocked.
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert_eq!(h.expanded, Some(Language::Python));
+    }
+
+    #[test]
+    fn confirm_button_unblocks_after_fix() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let text_row = nav_rows(spec_for(Language::Python))
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .unwrap();
+        h.row_cursor = text_row;
+        for ch in "bad name".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        // Backspace away the invalid characters.
+        for _ in 0.."bad name".len() {
+            h.handle_input(key(KeyCode::Backspace), &mut c);
+        }
+        for ch in "fastapi".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        let rows = h.current_nav_rows();
+        h.row_cursor = rows.len() - 1;
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.focus, Focus::Choice, "Confirm should now collapse");
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn next_blocked_when_any_selected_lang_has_invalid_custom_deps() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand Python
+        let text_row = nav_rows(spec_for(Language::Python))
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .unwrap();
+        h.row_cursor = text_row;
+        for ch in "bad name".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        // Esc back to Choice (preserves invalid input in scratch), navigate to Next, Enter.
+        h.handle_input(key(KeyCode::Esc), &mut c);
+        h.cursor = 0;
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue), "Next should be blocked");
+        assert!(c.language_configs.is_empty(), "config should not be committed");
+    }
+
+    #[test]
+    fn next_advances_when_invalid_lang_is_unchecked() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let text_row = nav_rows(spec_for(Language::Python))
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .unwrap();
+        h.row_cursor = text_row;
+        for ch in "bad name".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        // Esc back to Choice, Space to deselect Python (clears the gate).
+        h.handle_input(key(KeyCode::Esc), &mut c);
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        h.cursor = 0;
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done), "Next should advance");
+    }
+
+    #[test]
+    fn live_deps_problem_tracks_input_value() {
+        let mut h = with_selected(Language::Python);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        assert!(h.live_deps_problem().is_none(), "empty input is valid");
+        let text_row = nav_rows(spec_for(Language::Python))
+            .iter()
+            .position(|r| matches!(r, NavRow::CustomDepsInput))
+            .unwrap();
+        h.row_cursor = text_row;
+        for ch in "bad@".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        assert!(h.live_deps_problem().is_some());
     }
 
     // --- helpers ---

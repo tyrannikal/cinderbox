@@ -135,8 +135,8 @@ pub enum Vcs {
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
 enum Language {
     Rust,
-    Go,
     Python,
+    Go,
     JavaScript,
     TypeScript,
     Java,
