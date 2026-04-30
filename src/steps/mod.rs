@@ -3,6 +3,7 @@ use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 use crate::ProjectConfig;
 
+pub mod database;
 pub mod languages;
 pub mod project_type;
 pub mod vcs;

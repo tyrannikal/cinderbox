@@ -10,13 +10,15 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
+mod db_registry;
 mod registry;
 mod steps;
 mod widgets;
 
 use steps::{
-    CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, languages::LanguagesHandler,
-    project_type::ProjectTypeHandler, vcs::VcsHandler, workflows::WorkflowsHandler,
+    CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, database::DatabaseHandler,
+    languages::LanguagesHandler, project_type::ProjectTypeHandler, vcs::VcsHandler,
+    workflows::WorkflowsHandler,
 };
 
 fn main() -> io::Result<()> {
@@ -38,9 +40,31 @@ pub struct ProjectConfig {
     jj_colocate: bool,
     language_configs: Vec<LanguageConfig>,
     workflows: WorkflowConfig,
-    database: Option<Database>,
+    database: DatabaseConfig,
     remotes: Vec<Remote>,
     extras: Vec<Extra>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DatabaseConfig {
+    pub(crate) database: Option<Database>,
+    /// `Some(_)` only when `database` supports a run mode (server DBs).
+    /// SQLite and `None` always have `run_mode == None`.
+    pub(crate) run_mode: Option<RunMode>,
+    /// Toggled drivers, paired with the language each is meant for. Drivers
+    /// are scoped to languages the user already selected upstream — if the
+    /// user never picked Python, no Python drivers can appear here.
+    pub(crate) drivers: Vec<(Language, &'static str)>,
+    /// Empty = "use the database's default port". Validated by
+    /// `port_problem`; out-of-range values block Enter from advancing.
+    pub(crate) port: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
+pub enum RunMode {
+    Docker,
+    Native,
+    Managed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +216,7 @@ struct App {
     vcs_handler: VcsHandler,
     languages_handler: LanguagesHandler,
     workflows_handler: WorkflowsHandler,
+    database_handler: DatabaseHandler,
 }
 
 impl App {
@@ -206,6 +231,7 @@ impl App {
             self.vcs_handler.execute(&self.config)?;
             self.languages_handler.execute(&self.config)?;
             self.workflows_handler.execute(&self.config)?;
+            self.database_handler.execute(&self.config)?;
         }
         Ok(())
     }
@@ -304,6 +330,11 @@ impl App {
                 frame.render_widget(wizard_block, wizard_area);
                 self.workflows_handler.render(frame, inner);
             }
+            WizardStep::Database => {
+                let inner = wizard_block.inner(wizard_area);
+                frame.render_widget(wizard_block, wizard_area);
+                self.database_handler.render(frame, inner);
+            }
             _ => {
                 let content = self.step_content();
                 let wizard = Paragraph::new(content).block(wizard_block);
@@ -322,18 +353,6 @@ impl App {
         if self.step_index == 0 && self.project_type_handler.is_browsing() {
             self.project_type_handler.render_overlay(frame, wizard_area);
         }
-    }
-
-    fn render_select_list<T: std::fmt::Display>(&self, variants: &[T]) -> String {
-        variants
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let marker = if i == self.cursor { CURSOR_MARKER } else { CURSOR_BLANK };
-                format!("{marker}{v}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn render_multi_select_list<T: std::fmt::Display + PartialEq>(
@@ -359,7 +378,7 @@ impl App {
             WizardStep::Vcs => String::new(),          // handled by VcsHandler
             WizardStep::Languages => String::new(),    // handled by LanguagesHandler
             WizardStep::Workflows => String::new(),    // handled by WorkflowsHandler
-            WizardStep::Database => self.render_select_list(Database::VARIANTS),
+            WizardStep::Database => String::new(),     // handled by DatabaseHandler
             WizardStep::Remotes => {
                 self.render_multi_select_list(Remote::VARIANTS, &self.selected_remotes)
             }
@@ -462,14 +481,58 @@ impl App {
         lines.push("Workflows:".to_string());
         lines.push(format!("  CI: {ci}"));
         lines.push(format!("  Pre-commit: {pre}"));
-        lines.extend([
-            format!(
-                "Database: {}",
-                c.database.map_or("—".to_string(), |v| v.to_string())
-            ),
-            Self::format_config_list("Remotes", &c.remotes, "—"),
-            Self::format_config_list("Extras", &c.extras, "—"),
-        ]);
+        // Database (multi-line for selected DB; includes run mode, port, drivers per language)
+        let db = &c.database;
+        match db.database {
+            None => lines.push("Database: —".to_string()),
+            Some(Database::None) => lines.push("Database: None".to_string()),
+            Some(database) => {
+                lines.push(format!("Database: {database}"));
+                if let Some(rm) = db.run_mode {
+                    lines.push(format!("  Run mode: {rm}"));
+                }
+                let spec = db_registry::spec_for(database);
+                if let Some(default_port) = spec.default_port {
+                    let port_display = if db.port.is_empty() {
+                        format!("{default_port} (default)")
+                    } else {
+                        db.port.clone()
+                    };
+                    lines.push(format!("  Port: {port_display}"));
+                }
+                if !db.drivers.is_empty() {
+                    lines.push("  Drivers:".to_string());
+                    for lang in [
+                        Language::Rust,
+                        Language::Python,
+                        Language::Go,
+                        Language::JavaScript,
+                        Language::TypeScript,
+                        Language::Java,
+                        Language::CSharp,
+                        Language::Cpp,
+                        Language::Ruby,
+                        Language::Zig,
+                        Language::Haskell,
+                        Language::Lua,
+                    ] {
+                        let labels: Vec<&'static str> = db
+                            .drivers
+                            .iter()
+                            .filter(|(l, _)| *l == lang)
+                            .filter_map(|(_, id)| {
+                                db_registry::driver_by_id(lang, id).map(|d| d.label)
+                            })
+                            .collect();
+                        if !labels.is_empty() {
+                            lines.push(format!("    {lang}: {}", labels.join(", ")));
+                        }
+                    }
+                }
+            }
+        }
+        lines.push(Self::format_config_list("Remotes", &c.remotes, "—"));
+        lines.push(Self::format_config_list("Extras", &c.extras, "—"));
         lines
     }
 
@@ -490,6 +553,7 @@ impl App {
         actions.extend(self.vcs_handler.planned_actions(&self.config));
         actions.extend(self.languages_handler.planned_actions(&self.config));
         actions.extend(self.workflows_handler.planned_actions(&self.config));
+        actions.extend(self.database_handler.planned_actions(&self.config));
         if !actions.is_empty() {
             lines.push(String::new());
             lines.push("Planned actions:".to_string());
@@ -567,6 +631,15 @@ impl App {
                         }
                         return Ok(());
                     }
+                    WizardStep::Database => {
+                        match self.database_handler.handle_input(key, &mut self.config) {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
@@ -600,6 +673,7 @@ impl App {
             WizardStep::Vcs => Some(&self.vcs_handler),
             WizardStep::Languages => Some(&self.languages_handler),
             WizardStep::Workflows => Some(&self.workflows_handler),
+            WizardStep::Database => Some(&self.database_handler),
             _ => None,
         }
     }
@@ -620,8 +694,8 @@ impl App {
             WizardStep::ProjectType
             | WizardStep::Vcs
             | WizardStep::Languages
-            | WizardStep::Workflows => {}
-            WizardStep::Database => self.select(),
+            | WizardStep::Workflows
+            | WizardStep::Database => {}
             WizardStep::Remotes => {
                 self.config.remotes = std::mem::take(&mut self.selected_remotes);
                 self.next();
@@ -644,11 +718,8 @@ impl App {
             WizardStep::ProjectType
             | WizardStep::Vcs
             | WizardStep::Languages
-            | WizardStep::Workflows => {}
-            WizardStep::Database => {
-                self.config.database = Some(Database::VARIANTS[self.cursor]);
-                self.next();
-            }
+            | WizardStep::Workflows
+            | WizardStep::Database => {}
             WizardStep::Remotes => {
                 let remote = Remote::VARIANTS[self.cursor];
                 if let Some(pos) = self.selected_remotes.iter().position(|r| *r == remote) {
@@ -690,11 +761,10 @@ impl App {
                 self.workflows_handler.restore_from_config(&self.config);
                 return;
             }
-            WizardStep::Database => self
-                .config
-                .database
-                .and_then(|db| Database::VARIANTS.iter().position(|v| *v == db))
-                .unwrap_or(0),
+            WizardStep::Database => {
+                self.database_handler.restore_from_config(&self.config);
+                return;
+            }
             WizardStep::Remotes => {
                 self.selected_remotes.clone_from(&self.config.remotes);
                 0
@@ -740,7 +810,10 @@ mod tests {
         assert!(c.language_configs.is_empty());
         assert!(c.workflows.ci.is_none());
         assert!(c.workflows.pre_commit.is_none());
-        assert!(c.database.is_none());
+        assert!(c.database.database.is_none());
+        assert!(c.database.run_mode.is_none());
+        assert!(c.database.drivers.is_empty());
+        assert!(c.database.port.is_empty());
         assert!(c.remotes.is_empty());
         assert!(c.extras.is_empty());
     }
@@ -758,7 +831,7 @@ mod tests {
         c.vcs = Some(Vcs::Git);
         c.default_branch = "develop".to_string();
         assert_eq!(c.project_name, "test");
-        assert!(c.database.is_none());
+        assert!(c.database.database.is_none());
     }
 
     // --- Enum Display (strum) ---
@@ -858,8 +931,9 @@ mod tests {
 
     #[test]
     fn cursor_down_respects_option_count() {
+        // Remotes is still inline (uses App.cursor); Database moved to a handler.
         let mut app = App {
-            step_index: step_index_of(WizardStep::Database),
+            step_index: step_index_of(WizardStep::Remotes),
             cursor: 0,
             ..Default::default()
         };
@@ -873,7 +947,7 @@ mod tests {
     #[test]
     fn cursor_up_clamps_at_zero() {
         let mut app = App {
-            step_index: step_index_of(WizardStep::Database),
+            step_index: step_index_of(WizardStep::Remotes),
             cursor: 2,
             ..Default::default()
         };
@@ -887,20 +961,7 @@ mod tests {
 
     // Language multi-select behavior is now tested in steps::languages::tests.
 
-    // --- Database single-select ---
-
-    #[test]
-    fn database_select_commits_and_advances() {
-        let mut app = App {
-            step_index: step_index_of(WizardStep::Database),
-            cursor: 0, // PostgreSQL
-            ..Default::default()
-        };
-        let old_step = app.step_index;
-        app.select();
-        assert_eq!(app.config.database, Some(Database::PostgreSQL));
-        assert_eq!(app.step_index, old_step + 1);
-    }
+    // Database step behavior is tested in steps::database::tests.
 
     // --- Summary confirm ---
 
@@ -987,6 +1048,56 @@ mod tests {
     }
 
     #[test]
+    fn summary_shows_database_block() {
+        let mut app = App::default();
+        app.config.database = DatabaseConfig {
+            database: Some(Database::PostgreSQL),
+            run_mode: Some(RunMode::Docker),
+            drivers: vec![(Language::Python, "psycopg"), (Language::Rust, "sqlx")],
+            port: "5433".to_string(),
+        };
+        let summary = app.config_summary();
+        assert!(summary.contains("Database: PostgreSQL"));
+        assert!(summary.contains("Run mode: Docker"));
+        assert!(summary.contains("Port: 5433"));
+        assert!(summary.contains("Rust: sqlx"));
+        assert!(summary.contains("Python: psycopg"));
+    }
+
+    #[test]
+    fn summary_shows_database_default_port_when_empty() {
+        let mut app = App::default();
+        app.config.database = DatabaseConfig {
+            database: Some(Database::PostgreSQL),
+            run_mode: Some(RunMode::Docker),
+            drivers: vec![],
+            port: String::new(),
+        };
+        let summary = app.config_summary();
+        assert!(summary.contains("Port: 5432 (default)"));
+    }
+
+    #[test]
+    fn summary_shows_database_none_inline() {
+        let mut app = App::default();
+        app.config.database = DatabaseConfig {
+            database: Some(Database::None),
+            ..Default::default()
+        };
+        let summary = app.config_summary();
+        assert!(summary.contains("Database: None"));
+        assert!(!summary.contains("Run mode"));
+        assert!(!summary.contains("Port:"));
+    }
+
+    #[test]
+    fn summary_shows_database_dash_when_unset() {
+        let app = App::default();
+        let summary = app.config_summary();
+        assert!(summary.contains("Database: —"));
+    }
+
+    #[test]
     fn summary_shows_language_tools_and_workflows() {
         let mut app = App::default();
         app.config.language_configs = vec![LanguageConfig {
@@ -1021,20 +1132,7 @@ mod tests {
         assert_eq!(App::format_config_list("Languages", &items, "—"), "Languages: Rust, Go");
     }
 
-    // --- render_select_list / render_multi_select_list ---
-
-    #[test]
-    fn render_select_list_highlights_cursor() {
-        let app = App {
-            cursor: 1,
-            ..Default::default()
-        };
-        let output = app.render_select_list(&["Alpha", "Beta", "Gamma"]);
-        let lines: Vec<&str> = output.lines().collect();
-        assert!(lines[0].starts_with(CURSOR_BLANK));
-        assert!(lines[1].starts_with(CURSOR_MARKER));
-        assert!(lines[2].starts_with(CURSOR_BLANK));
-    }
+    // --- render_multi_select_list ---
 
     #[test]
     fn render_multi_select_list_shows_checks() {
