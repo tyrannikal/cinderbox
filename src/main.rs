@@ -240,12 +240,13 @@ impl App {
             }
             // Languages at Choice focus: row 0 is "Next" (advance); rows 1..= are
             // languages where Enter/→/L checks + expands the highlighted supported
-            // language (no-op on unsupported), Space toggles. SubField focus falls
-            // through to "Confirm <Enter>" below.
+            // language (no-op on unsupported), Space deselects-only (uncheck a
+            // checked language, no-op otherwise). SubField focus falls through
+            // to "Confirm <Enter>" below.
             WizardStep::Languages if !in_details => {
                 instruction_spans.push(" Select/Next ".into());
                 instruction_spans.push("<Enter/→/L> ".blue().bold());
-                instruction_spans.push(" Toggle ".into());
+                instruction_spans.push(" Deselect ".into());
                 instruction_spans.push("<Space> ".blue().bold());
             }
             WizardStep::Languages if in_details => {
