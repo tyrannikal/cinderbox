@@ -19,9 +19,9 @@ const CI_CHOICES: [CiProvider; 4] = [
     CiProvider::Woodpecker,
 ];
 const PRE_COMMIT_CHOICES: [PreCommitFramework; 3] = [
+    PreCommitFramework::None,
     PreCommitFramework::PreCommit,
     PreCommitFramework::Lefthook,
-    PreCommitFramework::None,
 ];
 /// Total number of radio options across both sections.
 const TOTAL_OPTIONS: usize = CI_CHOICES.len() + PRE_COMMIT_CHOICES.len();
@@ -43,8 +43,8 @@ impl Default for WorkflowsHandler {
             cursor: 0,
             // Default to GitHub Actions (index 1 in CI_CHOICES)
             ci_idx: 1,
-            // Default to pre-commit (index 0 in PRE_COMMIT_CHOICES)
-            pre_commit_idx: 0,
+            // Default to pre-commit (index 1 in PRE_COMMIT_CHOICES)
+            pre_commit_idx: 1,
         }
     }
 }
@@ -321,12 +321,13 @@ mod tests {
     fn space_selects_radio_at_cursor_in_pre_commit_section() {
         let mut h = WorkflowsHandler::default();
         let mut c = ProjectConfig::default();
-        // Move cursor into pre-commit section (cursor 4 = first pre-commit option)
+        // Move cursor into pre-commit section (cursor 4 = first pre-commit option = None)
         for _ in 0..CI_CHOICES.len() {
             h.handle_input(key(KeyCode::Down), &mut c);
         }
         assert_eq!(h.cursor, CI_CHOICES.len());
-        h.handle_input(key(KeyCode::Down), &mut c); // cursor 5 = lefthook
+        h.handle_input(key(KeyCode::Down), &mut c); // cursor 5 = pre-commit
+        h.handle_input(key(KeyCode::Down), &mut c); // cursor 6 = lefthook
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
         assert_eq!(h.pre_commit_selection(), PreCommitFramework::Lefthook);
         // CI section selection unchanged

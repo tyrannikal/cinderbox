@@ -1,22 +1,31 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::Paragraph,
+    text::{Line, Span},
+    widgets::{Block, Paragraph},
 };
-use strum::VariantArray;
 
 use crate::db_registry::{self, DatabaseSpec, DriverGroup};
 use crate::widgets::text_input::TextInput;
-use crate::{Database, Language, ProjectConfig, RunMode};
+use crate::{Database, DatabaseConfig, Language, ProjectConfig, RunMode};
 
-use super::{Focus, StepHandler, StepResult, render_choice_line};
+use super::{CURSOR_BLANK, CURSOR_MARKER, Focus, StepHandler, StepResult};
 
 const INDENT_SUBPANEL: u16 = 4;
 const INDENT_ROW: u16 = 6;
+const CONFIRM_BUTTON_WIDTH: u16 = 12;
+const CONFIRM_BUTTON_HEIGHT: u16 = 3;
 const RUN_MODE_CHOICES: &[RunMode] = &[RunMode::Docker, RunMode::Native, RunMode::Managed];
+
+const DB_CHOICES: [Database; 5] = [
+    Database::PostgreSQL,
+    Database::MySQL,
+    Database::SQLite,
+    Database::MongoDB,
+    Database::Redis,
+];
 
 /// Validates a port string typed into the port input.
 ///
@@ -49,25 +58,31 @@ enum DbNavRow {
     /// Port text input (single row). Only present when the spec has a
     /// `default_port`.
     Port,
+    /// Bordered "Confirm" button at the bottom of the sub-panel.
+    Confirm,
+}
+
+impl DbNavRow {
+    fn col_count(self, spec: &DatabaseSpec) -> usize {
+        match self {
+            Self::RunMode => RUN_MODE_CHOICES.len(),
+            Self::Drivers { group_idx, .. } => spec.driver_groups[group_idx].drivers.len(),
+            Self::Port => 1,
+            Self::Confirm => 1,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct DatabaseHandler {
     cursor: usize,
+    selected: Vec<Database>,
     expanded: Option<Database>,
     focus: Focus,
     row_cursor: usize,
     col_cursor: usize,
-    run_mode: RunMode,
-    /// Toggled drivers paired with their language. Persisted to
-    /// `config.database.drivers` on commit.
-    drivers: Vec<(Language, &'static str)>,
     port_input: TextInput,
-    /// Snapshot of the languages the user picked on the Languages step.
-    /// Cached here because `StepHandler::render` doesn't receive a config —
-    /// we need render and input to agree on which driver rows are shown.
-    /// Refreshed by `restore_from_config` (entry to this step) and by
-    /// every `handle_input` call.
+    scratch: Vec<DatabaseConfig>,
     upstream_languages: Vec<Language>,
 }
 
@@ -75,67 +90,124 @@ impl Default for DatabaseHandler {
     fn default() -> Self {
         Self {
             cursor: 0,
+            selected: Vec::new(),
             expanded: None,
             focus: Focus::Choice,
             row_cursor: 0,
             col_cursor: 0,
-            run_mode: RunMode::Docker,
-            drivers: Vec::new(),
             port_input: TextInput::new("Port"),
+            scratch: Vec::new(),
             upstream_languages: Vec::new(),
         }
     }
 }
 
 impl DatabaseHandler {
-    /// Restore handler state from the saved config when the user navigates back.
-    /// If the previously selected database has sub-fields, re-expand it and
-    /// rehydrate run mode / drivers / port from `config.database`.
     pub fn restore_from_config(&mut self, config: &ProjectConfig) {
         self.refresh_upstream(config);
-        let Some(database) = config.database.database else {
-            return;
-        };
-        self.cursor = Database::VARIANTS
-            .iter()
-            .position(|v| *v == database)
-            .unwrap_or(0);
+        self.selected.clear();
+        self.selected
+            .extend(config.database_configs.iter().map(|dc| dc.database));
+        self.scratch = config.database_configs.clone();
+        self.cursor = 0;
+        self.expanded = None;
+        self.focus = Focus::Choice;
+        self.row_cursor = 0;
+        self.col_cursor = 0;
+        self.port_input = TextInput::new("Port");
+    }
 
-        match database {
-            Database::None => {
-                self.expanded = None;
-                self.focus = Focus::Choice;
-            }
-            db => {
-                self.expanded = Some(db);
-                self.focus = Focus::SubField(0);
-                self.row_cursor = 0;
-                self.col_cursor = 0;
-                self.run_mode = config.database.run_mode.unwrap_or(RunMode::Docker);
-                self.drivers = config.database.drivers.clone();
-                self.port_input = TextInput::new("Port");
-                self.port_input.set_value(&config.database.port);
-            }
+    fn refresh_upstream(&mut self, config: &ProjectConfig) {
+        self.upstream_languages.clear();
+        self.upstream_languages
+            .extend(config.language_configs.iter().map(|lc| lc.language));
+    }
+
+    fn is_selected(&self, db: Database) -> bool {
+        self.selected.contains(&db)
+    }
+
+    fn scratch_for(&self, db: Database) -> Option<&DatabaseConfig> {
+        self.scratch.iter().find(|dc| dc.database == db)
+    }
+
+    fn scratch_mut_for(&mut self, db: Database) -> &mut DatabaseConfig {
+        if let Some(pos) = self.scratch.iter().position(|dc| dc.database == db) {
+            &mut self.scratch[pos]
+        } else {
+            let spec = db_registry::spec_for(db);
+            self.scratch
+                .push(DatabaseConfig::default_for(db, spec.supports_run_mode));
+            self.scratch.last_mut().unwrap()
         }
     }
 
-    /// Refresh the cached upstream-language snapshot from the config.
-    /// Called from `restore_from_config` and at the top of every
-    /// `handle_input` so render and input stay in agreement.
-    fn refresh_upstream(&mut self, config: &ProjectConfig) {
-        self.upstream_languages.clear();
-        for lc in &config.language_configs {
-            self.upstream_languages.push(lc.language);
+    fn expand(&mut self, db: Database) {
+        self.scratch_mut_for(db);
+        let port_value = self
+            .scratch_for(db)
+            .map(|s| s.port.clone())
+            .unwrap_or_default();
+        self.expanded = Some(db);
+        self.focus = Focus::SubField(0);
+        self.row_cursor = 0;
+        self.col_cursor = 0;
+        self.port_input = TextInput::new("Port");
+        self.port_input.set_value(port_value);
+    }
+
+    fn sync_port_to_scratch(&mut self) {
+        if let Some(db) = self.expanded {
+            let value = self.port_input.value().to_string();
+            self.scratch_mut_for(db).port = value;
+        }
+    }
+
+    fn collapse_persist(&mut self) {
+        self.sync_port_to_scratch();
+        self.expanded = None;
+        self.focus = Focus::Choice;
+    }
+
+    fn collapse_persist_keep_expanded(&mut self) {
+        self.sync_port_to_scratch();
+    }
+
+    fn commit_to_config(&mut self, config: &mut ProjectConfig) {
+        self.sync_port_to_scratch();
+        config.database_configs = self
+            .selected
+            .iter()
+            .map(|db| {
+                debug_assert!(self.scratch_for(*db).is_some());
+                self.scratch
+                    .iter()
+                    .find(|s| s.database == *db)
+                    .cloned()
+                    .expect("scratch guaranteed by expand")
+            })
+            .collect();
+    }
+
+    fn choice_count(&self) -> usize {
+        DB_CHOICES.len() + 1
+    }
+
+    fn cursor_db(&self) -> Option<Database> {
+        if self.cursor == 0 {
+            None
+        } else {
+            Some(DB_CHOICES[self.cursor - 1])
         }
     }
 
     /// Build the nav rows for the currently expanded database, filtering
-    /// driver groups down to languages the user picked upstream (cached in
-    /// `upstream_languages`). A server DB with no upstream language picks
-    /// still shows RunMode + Port.
+    /// driver groups down to languages the user picked upstream.
     fn nav_rows(&self) -> Vec<DbNavRow> {
         let mut rows = Vec::new();
-        let Some(db) = self.expanded else { return rows };
+        let Some(db) = self.expanded else {
+            return rows;
+        };
         let spec = db_registry::spec_for(db);
 
         if spec.supports_run_mode {
@@ -156,6 +228,7 @@ impl DatabaseHandler {
         if spec.default_port.is_some() {
             rows.push(DbNavRow::Port);
         }
+        rows.push(DbNavRow::Confirm);
         rows
     }
 
@@ -163,74 +236,65 @@ impl DatabaseHandler {
         self.nav_rows().get(self.row_cursor).copied()
     }
 
-    fn col_count(&self, row: DbNavRow, spec: &DatabaseSpec) -> usize {
-        match row {
-            DbNavRow::RunMode => RUN_MODE_CHOICES.len(),
-            DbNavRow::Drivers { group_idx, .. } => spec.driver_groups[group_idx].drivers.len(),
-            DbNavRow::Port => 1,
-        }
-    }
-
     fn clamp_col(&mut self, spec: &DatabaseSpec) {
         if let Some(row) = self.current_row() {
-            let max = self.col_count(row, spec).saturating_sub(1);
+            let max = row.col_count(spec).saturating_sub(1);
             self.col_cursor = self.col_cursor.min(max);
         } else {
             self.col_cursor = 0;
         }
     }
 
-    /// True if the (`language`, `id`) pair is currently toggled on.
+    fn current_run_mode(&self) -> RunMode {
+        self.expanded
+            .and_then(|db| self.scratch_for(db))
+            .and_then(|s| s.run_mode)
+            .unwrap_or(RunMode::Docker)
+    }
+
     fn driver_checked(&self, language: Language, id: &str) -> bool {
-        self.drivers.iter().any(|(l, d)| *l == language && *d == id)
+        self.expanded
+            .and_then(|db| self.scratch_for(db))
+            .is_some_and(|s| s.drivers.iter().any(|(l, d)| *l == language && *d == id))
     }
 
     fn toggle_driver(&mut self, language: Language, id: &'static str) {
-        if let Some(pos) = self
-            .drivers
-            .iter()
-            .position(|(l, d)| *l == language && *d == id)
-        {
-            self.drivers.remove(pos);
-        } else {
-            self.drivers.push((language, id));
+        if let Some(db) = self.expanded {
+            let s = self.scratch_mut_for(db);
+            if let Some(pos) = s.drivers.iter().position(|(l, d)| *l == language && *d == id) {
+                s.drivers.remove(pos);
+            } else {
+                s.drivers.push((language, id));
+            }
         }
     }
 
-    fn port_valid(&self) -> bool {
-        port_problem(self.port_input.value()).is_none()
+    fn live_port_problem(&self) -> Option<&'static str> {
+        port_problem(self.port_input.value())
     }
 
-    fn validation_msg(&self) -> &'static str {
-        port_problem(self.port_input.value()).unwrap_or("")
+    fn selected_port_problem(&self) -> Option<String> {
+        self.selected.iter().find_map(|db| {
+            let port = self.scratch_for(*db).map_or("", |s| s.port.as_str());
+            port_problem(port).map(|msg| format!("{db}: {msg}"))
+        })
     }
 
-    fn commit_to_config(&self, config: &mut ProjectConfig) {
-        let database = self.expanded.unwrap_or(Database::None);
-        let spec = db_registry::spec_for(database);
-        config.database = crate::DatabaseConfig {
-            database: Some(database),
-            run_mode: spec.supports_run_mode.then_some(self.run_mode),
-            drivers: if spec.driver_groups.is_empty() {
-                Vec::new()
-            } else {
-                self.drivers.clone()
-            },
-            port: if spec.default_port.is_some() {
-                self.port_input.value().to_string()
-            } else {
-                String::new()
-            },
-        };
+    fn toggle_db(&mut self, db: Database) {
+        if let Some(pos) = self.selected.iter().position(|d| *d == db) {
+            self.selected.remove(pos);
+        } else {
+            self.selected.push(db);
+        }
     }
 
-    // --- Choice focus ---
+    // --- Input handling ---
 
-    fn handle_choice(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
+    fn handle_choice_input(&mut self, key: KeyCode, config: &mut ProjectConfig) -> StepResult {
         match key {
             KeyCode::Char('q') => StepResult::Quit,
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.cursor + 1 < Database::VARIANTS.len() {
+                if self.cursor + 1 < self.choice_count() {
                     self.cursor += 1;
                 }
                 StepResult::Continue
@@ -239,27 +303,33 @@ impl DatabaseHandler {
                 self.cursor = self.cursor.saturating_sub(1);
                 StepResult::Continue
             }
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right | KeyCode::Char('l') => {
-                let choice = Database::VARIANTS[self.cursor];
-                if choice == Database::None {
-                    self.expanded = None;
-                    config.database = crate::DatabaseConfig {
-                        database: Some(Database::None),
-                        run_mode: None,
-                        drivers: Vec::new(),
-                        port: String::new(),
-                    };
-                    return StepResult::Done;
+            KeyCode::Char(' ') => {
+                if let Some(db) = self.cursor_db()
+                    && self.is_selected(db)
+                {
+                    self.toggle_db(db);
                 }
-                self.expanded = Some(choice);
-                self.focus = Focus::SubField(0);
-                self.row_cursor = 0;
-                self.col_cursor = 0;
                 StepResult::Continue
             }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match self.cursor_db() {
+                None => {
+                    if self.selected_port_problem().is_some() {
+                        return StepResult::Continue;
+                    }
+                    self.commit_to_config(config);
+                    StepResult::Done
+                }
+                Some(db) => {
+                    if !self.is_selected(db) {
+                        self.selected.push(db);
+                    }
+                    self.expand(db);
+                    StepResult::Continue
+                }
+            },
             KeyCode::Left | KeyCode::Char('h') => {
                 if self.expanded.is_some() {
-                    self.expanded = None;
+                    self.collapse_persist();
                     StepResult::Continue
                 } else {
                     StepResult::Back
@@ -269,14 +339,20 @@ impl DatabaseHandler {
         }
     }
 
-    // --- SubField focus ---
-
-    fn handle_subfield(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
-        let Some(database) = self.expanded else {
+    fn handle_subfield_input(&mut self, key: KeyEvent, _config: &mut ProjectConfig) -> StepResult {
+        let Some(db) = self.expanded else {
             return StepResult::Continue;
         };
-        let spec = db_registry::spec_for(database);
+        let spec = db_registry::spec_for(db);
         let rows = self.nav_rows();
+
+        if rows.is_empty() {
+            return StepResult::Continue;
+        }
+
+        let row = rows[self.row_cursor];
+        let on_port = matches!(row, DbNavRow::Port);
+        let on_confirm = matches!(row, DbNavRow::Confirm);
 
         // Universal nav keys.
         match key.code {
@@ -286,6 +362,7 @@ impl DatabaseHandler {
             }
             KeyCode::Up => {
                 if self.row_cursor == 0 {
+                    self.collapse_persist_keep_expanded();
                     self.focus = Focus::Choice;
                 } else {
                     self.row_cursor -= 1;
@@ -308,62 +385,115 @@ impl DatabaseHandler {
                 self.advance_flattened(&rows, spec, true);
                 return StepResult::Continue;
             }
-            KeyCode::Enter => {
-                if !self.port_valid() {
-                    return StepResult::Continue;
-                }
-                self.commit_to_config(config);
-                return StepResult::Done;
-            }
             _ => {}
         }
 
-        // Row-kind dispatch.
-        let Some(row) = rows.get(self.row_cursor).copied() else {
+        // Confirm button row.
+        if on_confirm {
+            match key.code {
+                KeyCode::Char('q') => return StepResult::Quit,
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    if self.live_port_problem().is_none() {
+                        self.collapse_persist();
+                    }
+                }
+                KeyCode::Char('k') => {
+                    if self.row_cursor == 0 {
+                        self.collapse_persist_keep_expanded();
+                        self.focus = Focus::Choice;
+                    } else {
+                        self.row_cursor -= 1;
+                        self.clamp_col(spec);
+                    }
+                }
+                KeyCode::Char('j') => {
+                    if self.row_cursor + 1 < rows.len() {
+                        self.row_cursor += 1;
+                        self.clamp_col(spec);
+                    }
+                }
+                _ => {}
+            }
             return StepResult::Continue;
-        };
+        }
+
+        // Port text input row.
+        if on_port {
+            if matches!(key.code, KeyCode::Enter) {
+                if self.live_port_problem().is_none() {
+                    self.collapse_persist();
+                }
+                return StepResult::Continue;
+            }
+            match key.code {
+                KeyCode::Char(c) => {
+                    self.port_input.handle_input(KeyCode::Char(c));
+                }
+                KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End => {
+                    self.port_input.handle_input(key.code);
+                }
+                _ => {}
+            }
+            self.sync_port_to_scratch();
+            return StepResult::Continue;
+        }
+
+        // RunMode and Drivers rows.
         match row {
             DbNavRow::RunMode => self.handle_run_mode_key(key.code),
-            DbNavRow::Drivers { language, group_idx } => {
-                self.handle_drivers_key(key.code, language, &spec.driver_groups[group_idx])
-            }
-            DbNavRow::Port => self.handle_port_key(key.code),
+            DbNavRow::Drivers {
+                language,
+                group_idx,
+            } => self.handle_drivers_key(key.code, language, &spec.driver_groups[group_idx]),
+            _ => StepResult::Continue,
         }
     }
 
     fn handle_run_mode_key(&mut self, key: KeyCode) -> StepResult {
         match key {
             KeyCode::Char('q') => StepResult::Quit,
-            KeyCode::Char('j') | KeyCode::Char('k') => {
-                // j/k duplicate Up/Down — handled by the caller.
-                StepResult::Continue
-            }
+            KeyCode::Char('j') | KeyCode::Char('k') => StepResult::Continue,
             KeyCode::Left | KeyCode::Char('h') => {
+                let run_mode = self.current_run_mode();
                 let idx = RUN_MODE_CHOICES
                     .iter()
-                    .position(|m| *m == self.run_mode)
+                    .position(|m| *m == run_mode)
                     .unwrap_or(0);
-                if idx > 0 {
-                    self.run_mode = RUN_MODE_CHOICES[idx - 1];
+                if idx > 0
+                    && let Some(db) = self.expanded
+                {
+                    self.scratch_mut_for(db).run_mode = Some(RUN_MODE_CHOICES[idx - 1]);
                 }
                 StepResult::Continue
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                let run_mode = self.current_run_mode();
                 let idx = RUN_MODE_CHOICES
                     .iter()
-                    .position(|m| *m == self.run_mode)
+                    .position(|m| *m == run_mode)
                     .unwrap_or(0);
-                if idx + 1 < RUN_MODE_CHOICES.len() {
-                    self.run_mode = RUN_MODE_CHOICES[idx + 1];
+                if idx + 1 < RUN_MODE_CHOICES.len()
+                    && let Some(db) = self.expanded
+                {
+                    self.scratch_mut_for(db).run_mode = Some(RUN_MODE_CHOICES[idx + 1]);
                 }
                 StepResult::Continue
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                let run_mode = self.current_run_mode();
                 let idx = RUN_MODE_CHOICES
                     .iter()
-                    .position(|m| *m == self.run_mode)
+                    .position(|m| *m == run_mode)
                     .unwrap_or(0);
-                self.run_mode = RUN_MODE_CHOICES[(idx + 1) % RUN_MODE_CHOICES.len()];
+                let next = RUN_MODE_CHOICES[(idx + 1) % RUN_MODE_CHOICES.len()];
+                if let Some(db) = self.expanded {
+                    self.scratch_mut_for(db).run_mode = Some(next);
+                }
                 StepResult::Continue
             }
             _ => StepResult::Continue,
@@ -388,7 +518,7 @@ impl DatabaseHandler {
                 }
                 StepResult::Continue
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char(' ') | KeyCode::Enter => {
                 if let Some(driver) = group.drivers.get(self.col_cursor) {
                     self.toggle_driver(language, driver.id);
                 }
@@ -398,42 +528,15 @@ impl DatabaseHandler {
         }
     }
 
-    fn handle_port_key(&mut self, key: KeyCode) -> StepResult {
-        match key {
-            // Letters typed into the port input would be captured by `Char(c)`
-            // below — the validator catches non-digit values. q only quits
-            // when the input is empty (otherwise the user is typing a port
-            // and "q" would be a literal character). For consistency with the
-            // VCS text-input convention we forward q to the input as a char.
-            KeyCode::Char(c) => {
-                self.port_input.handle_input(KeyCode::Char(c));
-                StepResult::Continue
-            }
-            KeyCode::Backspace
-            | KeyCode::Delete
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Home
-            | KeyCode::End => {
-                self.port_input.handle_input(key);
-                StepResult::Continue
-            }
-            _ => StepResult::Continue,
-        }
-    }
-
-    /// Cycle the 2D cursor through every (row, col) position as a flat
-    /// linear sequence. Used by Tab / BackTab.
     fn advance_flattened(&mut self, rows: &[DbNavRow], spec: &DatabaseSpec, backward: bool) {
         if rows.is_empty() {
             return;
         }
-        let mut flat: Vec<(usize, usize)> = Vec::new();
-        for (r, row) in rows.iter().enumerate() {
-            for c in 0..self.col_count(*row, spec) {
-                flat.push((r, c));
-            }
-        }
+        let flat: Vec<(usize, usize)> = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| (0..row.col_count(spec)).map(move |c| (r, c)))
+            .collect();
         if flat.is_empty() {
             return;
         }
@@ -442,7 +545,11 @@ impl DatabaseHandler {
             .position(|(r, c)| *r == self.row_cursor && *c == self.col_cursor)
             .unwrap_or(0);
         let next = if backward {
-            if pos == 0 { flat.len() - 1 } else { pos - 1 }
+            if pos == 0 {
+                flat.len() - 1
+            } else {
+                pos - 1
+            }
         } else {
             (pos + 1) % flat.len()
         };
@@ -453,10 +560,55 @@ impl DatabaseHandler {
 
     // --- Rendering ---
 
+    fn render_next_line(&self, frame: &mut Frame, area: Rect) {
+        let highlighted = matches!(self.focus, Focus::Choice) && self.cursor == 0;
+        let cursor_marker = if highlighted {
+            CURSOR_MARKER
+        } else {
+            CURSOR_BLANK
+        };
+        let style = Style::default().add_modifier(Modifier::BOLD);
+        let text = format!("{cursor_marker}Next →");
+        frame.render_widget(Paragraph::new(Line::from(text).style(style)), area);
+    }
+
+    fn render_choice_line(&self, frame: &mut Frame, area: Rect, db: Database, idx: usize) {
+        let cursor_marker = if matches!(self.focus, Focus::Choice) && idx == self.cursor {
+            CURSOR_MARKER
+        } else {
+            CURSOR_BLANK
+        };
+        let check = if self.is_selected(db) { "[x]" } else { "[ ]" };
+        let text = format!("{cursor_marker}{check} {db}");
+        frame.render_widget(Paragraph::new(Line::from(text)), area);
+    }
+
+    fn render_confirm_button(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let block_style = if focused {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::bordered().style(block_style);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let label_style = if focused {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from("Confirm").style(label_style)).centered(),
+            inner,
+        );
+    }
+
     fn render_run_mode_row(&self, frame: &mut Frame, area: Rect, focused: bool) {
-        let mut spans = vec![ratatui::text::Span::raw("Run mode: ")];
+        let run_mode = self.current_run_mode();
+        let mut spans = vec![Span::raw("Run mode: ")];
         for (i, mode) in RUN_MODE_CHOICES.iter().enumerate() {
-            let glyph = if *mode == self.run_mode { "●" } else { "○" };
+            let glyph = if *mode == run_mode { "●" } else { "○" };
             let cell = format!("{glyph} {mode}");
             let style = if focused && self.col_cursor == i {
                 Style::default().fg(Color::Black).bg(Color::White)
@@ -465,9 +617,9 @@ impl DatabaseHandler {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            spans.push(ratatui::text::Span::styled(cell, style));
+            spans.push(Span::styled(cell, style));
             if i + 1 < RUN_MODE_CHOICES.len() {
-                spans.push(ratatui::text::Span::raw("   "));
+                spans.push(Span::raw("   "));
             }
         }
         let line_style = if focused {
@@ -486,7 +638,6 @@ impl DatabaseHandler {
         group: &DriverGroup,
         focused_row: bool,
     ) {
-        // First sub-row: language label.
         let label_rect = Rect {
             x: area.x,
             y: area.y,
@@ -495,12 +646,12 @@ impl DatabaseHandler {
         };
         frame.render_widget(
             Paragraph::new(
-                Line::from(format!("{language}:")).style(Style::default().add_modifier(Modifier::BOLD)),
+                Line::from(format!("{language}:"))
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
             ),
             label_rect,
         );
 
-        // Second sub-row: checkboxes.
         let row_rect = Rect {
             x: area.x + 2,
             y: area.y + 1,
@@ -522,33 +673,171 @@ impl DatabaseHandler {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            spans.push(ratatui::text::Span::styled(cell, style));
+            spans.push(Span::styled(cell, style));
             if i + 1 < group.drivers.len() {
-                spans.push(ratatui::text::Span::raw("   "));
+                spans.push(Span::raw("   "));
             }
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), row_rect);
+    }
+
+    fn render_expanded_panel(&self, frame: &mut Frame, db: Database, area: Rect) -> u16 {
+        let spec = db_registry::spec_for(db);
+        let rows = self.nav_rows();
+        let mut y = area.y;
+        let bottom = area.y + area.height;
+        let focused_row =
+            |r: usize| matches!(self.focus, Focus::SubField(_)) && self.row_cursor == r;
+
+        for (idx, row) in rows.iter().enumerate() {
+            match *row {
+                DbNavRow::RunMode => {
+                    if y >= bottom {
+                        return y;
+                    }
+                    let row_area = Rect {
+                        x: area.x + INDENT_SUBPANEL,
+                        y,
+                        width: area.width.saturating_sub(INDENT_SUBPANEL),
+                        height: 1,
+                    };
+                    self.render_run_mode_row(frame, row_area, focused_row(idx));
+                    y += 1;
+                }
+                DbNavRow::Drivers {
+                    language,
+                    group_idx,
+                } => {
+                    if y + 1 >= bottom {
+                        return y;
+                    }
+                    let group = &spec.driver_groups[group_idx];
+                    let row_area = Rect {
+                        x: area.x + INDENT_ROW,
+                        y,
+                        width: area.width.saturating_sub(INDENT_ROW),
+                        height: 2,
+                    };
+                    self.render_drivers_row(frame, row_area, language, group, focused_row(idx));
+                    y += 2;
+                }
+                DbNavRow::Port => {
+                    if y + 2 >= bottom {
+                        return y;
+                    }
+                    let row_area = Rect {
+                        x: area.x + INDENT_SUBPANEL,
+                        y,
+                        width: area.width.saturating_sub(INDENT_SUBPANEL),
+                        height: 3,
+                    };
+                    self.port_input.render(frame, row_area, focused_row(idx));
+                    y += 3;
+                }
+                DbNavRow::Confirm => {
+                    if let Some(msg) = self.live_port_problem()
+                        && y < bottom
+                    {
+                        let rect = Rect {
+                            x: area.x + INDENT_ROW,
+                            y,
+                            width: area.width.saturating_sub(INDENT_ROW),
+                            height: 1,
+                        };
+                        frame.render_widget(
+                            Paragraph::new(
+                                Line::from(format!("⚠  {msg}"))
+                                    .style(Style::default().fg(Color::Yellow)),
+                            ),
+                            rect,
+                        );
+                        y += 1;
+                    }
+                    if y + CONFIRM_BUTTON_HEIGHT <= bottom {
+                        let button_rect = Rect {
+                            x: area.x + INDENT_ROW,
+                            y,
+                            width: CONFIRM_BUTTON_WIDTH
+                                .min(area.width.saturating_sub(INDENT_ROW)),
+                            height: CONFIRM_BUTTON_HEIGHT,
+                        };
+                        self.render_confirm_button(frame, button_rect, focused_row(idx));
+                        y += CONFIRM_BUTTON_HEIGHT;
+                    }
+                }
+            }
+        }
+
+        y
     }
 }
 
 impl StepHandler for DatabaseHandler {
     fn render(&self, frame: &mut Frame, area: Rect) {
-        // Render walks the cached `upstream_languages` snapshot rather than
-        // the live config (the trait gives us no `&ProjectConfig`). The
-        // snapshot is refreshed by `restore_from_config` on entry to this
-        // step and by every `handle_input` call, so it stays in lockstep
-        // with what the input layer's `nav_rows()` sees.
-        self.render_with_areas(frame, area);
+        let mut y = area.y;
+        let bottom = area.y + area.height;
+
+        // "Next" pseudo-row at index 0.
+        if y < bottom {
+            let next_rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            self.render_next_line(frame, next_rect);
+            y += 1;
+        }
+
+        for (i, db) in DB_CHOICES.iter().enumerate() {
+            if y >= bottom {
+                break;
+            }
+            let choice_rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            self.render_choice_line(frame, choice_rect, *db, i + 1);
+            y += 1;
+            if self.expanded == Some(*db) {
+                let panel_area = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: bottom.saturating_sub(y),
+                };
+                y = self.render_expanded_panel(frame, *db, panel_area);
+            }
+        }
+
+        // Choice-level warning when any selected database has invalid port.
+        if let Some(msg) = self.selected_port_problem()
+            && y < bottom
+        {
+            let rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from(format!("⚠  Cannot advance: {msg}"))
+                        .style(Style::default().fg(Color::Yellow)),
+                ),
+                rect,
+            );
+        }
     }
 
     fn handle_input(&mut self, key: KeyEvent, config: &mut ProjectConfig) -> StepResult {
-        // Refresh the upstream-language cache so render and input agree on
-        // which driver rows to show. Cheap (a small Vec clone).
         self.refresh_upstream(config);
         match self.focus {
-            Focus::Choice => self.handle_choice(key.code, config),
-            Focus::SubField(_) => self.handle_subfield(key, config),
-            Focus::Browsing => unreachable!(),
+            Focus::Choice => self.handle_choice_input(key.code, config),
+            Focus::SubField(_) => self.handle_subfield_input(key, config),
+            Focus::Browsing => StepResult::Continue,
         }
     }
 
@@ -561,135 +850,37 @@ impl StepHandler for DatabaseHandler {
     }
 
     fn planned_actions(&self, config: &ProjectConfig) -> Vec<String> {
-        let Some(database) = config.database.database else {
-            return vec![];
-        };
-        if database == Database::None {
-            return vec![];
-        }
-        let mut actions = vec![format!("Configure {database}")];
-        if let Some(rm) = config.database.run_mode {
-            actions.push(format!("Run mode: {rm}"));
-        }
-        if !config.database.drivers.is_empty() {
-            let labels: Vec<String> = config
-                .database
-                .drivers
-                .iter()
-                .filter_map(|(lang, id)| db_registry::driver_by_id(*lang, id).map(|d| d.label.to_string()))
-                .collect();
-            if !labels.is_empty() {
-                actions.push(format!("Drivers: {}", labels.join(", ")));
+        let mut actions = Vec::new();
+        for dc in &config.database_configs {
+            actions.push(format!("Configure {}", dc.database));
+            if let Some(rm) = dc.run_mode {
+                actions.push(format!("Run mode: {rm}"));
+            }
+            if !dc.drivers.is_empty() {
+                let labels: Vec<String> = dc
+                    .drivers
+                    .iter()
+                    .filter_map(|(lang, id)| {
+                        db_registry::driver_by_id(*lang, id).map(|d| d.label.to_string())
+                    })
+                    .collect();
+                if !labels.is_empty() {
+                    actions.push(format!("Drivers: {}", labels.join(", ")));
+                }
             }
         }
         actions
     }
 
     fn execute(&self, _config: &ProjectConfig) -> std::io::Result<()> {
-        // Database setup is post-MVP; the wizard only collects choices.
         Ok(())
-    }
-}
-
-impl DatabaseHandler {
-    /// Walks `Database::VARIANTS`, painting each choice line; an expanded
-    /// choice is followed by its sub-panel rendered indented below. Driver
-    /// rows are emitted exactly when `nav_rows()` would emit them — i.e.
-    /// only for languages in the cached `upstream_languages` snapshot, so
-    /// render and input agree on the visible row set.
-    fn render_with_areas(&self, frame: &mut Frame, area: Rect) {
-        let rows = self.nav_rows();
-        let constraints = self.layout_constraints_for(&rows);
-        let areas = Layout::vertical(constraints).split(area);
-        let mut idx = 0;
-        let focused_row =
-            |r: usize| matches!(self.focus, Focus::SubField(_)) && self.row_cursor == r;
-
-        for (i, db) in Database::VARIANTS.iter().enumerate() {
-            let highlighted = matches!(self.focus, Focus::Choice) && self.cursor == i;
-            render_choice_line(frame, areas[idx], db, highlighted);
-            idx += 1;
-
-            if self.expanded != Some(*db) {
-                continue;
-            }
-
-            for (row_idx, row) in rows.iter().enumerate() {
-                match *row {
-                    DbNavRow::RunMode => {
-                        let row_area = Rect {
-                            x: areas[idx].x + INDENT_SUBPANEL,
-                            width: areas[idx].width.saturating_sub(INDENT_SUBPANEL),
-                            ..areas[idx]
-                        };
-                        self.render_run_mode_row(frame, row_area, focused_row(row_idx));
-                        idx += 1;
-                    }
-                    DbNavRow::Drivers { language, group_idx } => {
-                        let spec = db_registry::spec_for(*db);
-                        let group = &spec.driver_groups[group_idx];
-                        let row_area = Rect {
-                            x: areas[idx].x + INDENT_ROW,
-                            width: areas[idx].width.saturating_sub(INDENT_ROW),
-                            ..areas[idx]
-                        };
-                        self.render_drivers_row(
-                            frame,
-                            row_area,
-                            language,
-                            group,
-                            focused_row(row_idx),
-                        );
-                        idx += 1;
-                    }
-                    DbNavRow::Port => {
-                        let row_area = Rect {
-                            x: areas[idx].x + INDENT_SUBPANEL,
-                            width: areas[idx].width.saturating_sub(INDENT_SUBPANEL),
-                            ..areas[idx]
-                        };
-                        self.port_input.render(frame, row_area, focused_row(row_idx));
-                        idx += 1;
-                    }
-                }
-            }
-        }
-
-        idx += 1; // spacer
-        if idx < areas.len() {
-            let msg = self.validation_msg();
-            if !msg.is_empty() {
-                let style = Style::default().fg(Color::Yellow);
-                frame.render_widget(Paragraph::new(Line::from(msg).style(style)), areas[idx]);
-            }
-        }
-    }
-
-    fn layout_constraints_for(&self, rows: &[DbNavRow]) -> Vec<Constraint> {
-        let mut constraints = Vec::new();
-        for db in Database::VARIANTS {
-            constraints.push(Constraint::Length(1)); // choice line
-            if self.expanded == Some(*db) {
-                for row in rows {
-                    constraints.push(match row {
-                        DbNavRow::RunMode => Constraint::Length(1),
-                        DbNavRow::Drivers { .. } => Constraint::Length(2),
-                        DbNavRow::Port => Constraint::Length(3),
-                    });
-                }
-            }
-        }
-        constraints.push(Constraint::Length(1)); // spacer
-        constraints.push(Constraint::Length(1)); // validation line
-        constraints.push(Constraint::Min(0));
-        constraints
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DatabaseConfig, LanguageConfig};
+    use crate::LanguageConfig;
     use crossterm::event::KeyModifiers;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -706,8 +897,21 @@ mod tests {
         }
     }
 
-    fn cursor_for(db: Database) -> usize {
-        Database::VARIANTS.iter().position(|v| *v == db).unwrap()
+    fn with_cursor_on(db: Database) -> DatabaseHandler {
+        let idx = DB_CHOICES.iter().position(|d| *d == db).unwrap();
+        DatabaseHandler {
+            cursor: idx + 1,
+            ..Default::default()
+        }
+    }
+
+    fn with_selected(db: Database) -> DatabaseHandler {
+        let idx = DB_CHOICES.iter().position(|d| *d == db).unwrap();
+        DatabaseHandler {
+            cursor: idx + 1,
+            selected: vec![db],
+            ..Default::default()
+        }
     }
 
     // --- Defaults ---
@@ -718,131 +922,228 @@ mod tests {
         assert_eq!(h.focus, Focus::Choice);
         assert!(h.expanded.is_none());
         assert_eq!(h.cursor, 0);
-        assert_eq!(h.run_mode, RunMode::Docker);
-        assert!(h.drivers.is_empty());
-        assert_eq!(h.port_input.value(), "");
+        assert!(h.selected.is_empty());
+        assert!(h.scratch.is_empty());
+        assert!(!h.in_details());
+        assert!(!h.is_expanded());
     }
 
     // --- Choice navigation ---
 
     #[test]
-    fn choice_down_clamps_at_last() {
+    fn cursor_down_and_up_at_choice_level() {
+        let mut h = DatabaseHandler::default();
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Down), &mut c);
+        assert_eq!(h.cursor, 1);
+        h.handle_input(key(KeyCode::Char('j')), &mut c);
+        assert_eq!(h.cursor, 2);
+        h.handle_input(key(KeyCode::Up), &mut c);
+        assert_eq!(h.cursor, 1);
+        h.handle_input(key(KeyCode::Char('k')), &mut c);
+        assert_eq!(h.cursor, 0);
+    }
+
+    #[test]
+    fn cursor_clamps_at_bounds() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
         for _ in 0..20 {
             h.handle_input(key(KeyCode::Down), &mut c);
         }
-        assert_eq!(h.cursor, Database::VARIANTS.len() - 1);
-    }
-
-    #[test]
-    fn choice_up_clamps_at_zero() {
-        let mut h = DatabaseHandler {
-            cursor: 3,
-            ..Default::default()
-        };
-        let mut c = ProjectConfig::default();
-        h.handle_input(key(KeyCode::Up), &mut c);
-        h.handle_input(key(KeyCode::Up), &mut c);
-        h.handle_input(key(KeyCode::Up), &mut c);
-        h.handle_input(key(KeyCode::Up), &mut c);
+        assert_eq!(h.cursor, DB_CHOICES.len());
+        for _ in 0..20 {
+            h.handle_input(key(KeyCode::Up), &mut c);
+        }
         assert_eq!(h.cursor, 0);
     }
 
-    // --- None commits immediately ---
+    // --- Next row ---
 
     #[test]
-    fn none_commits_and_returns_done() {
+    fn enter_on_next_commits_and_advances() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::None);
-        let r = h.handle_input(key(KeyCode::Enter), &mut c);
-        assert!(matches!(r, StepResult::Done));
-        assert_eq!(c.database.database, Some(Database::None));
-        assert!(c.database.run_mode.is_none());
-        assert!(c.database.drivers.is_empty());
-        assert!(c.database.port.is_empty());
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert!(c.database_configs.is_empty());
     }
 
     #[test]
-    fn space_on_none_also_commits() {
+    fn right_on_next_commits_and_advances() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::None);
-        let r = h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert!(matches!(r, StepResult::Done));
-        assert_eq!(c.database.database, Some(Database::None));
+        let result = h.handle_input(key(KeyCode::Right), &mut c);
+        assert!(matches!(result, StepResult::Done));
     }
 
-    // --- Expansion ---
+    #[test]
+    fn enter_on_next_with_selections_commits_all() {
+        let mut h = DatabaseHandler {
+            selected: vec![Database::PostgreSQL, Database::Redis],
+            ..Default::default()
+        };
+        h.scratch_mut_for(Database::PostgreSQL);
+        h.scratch_mut_for(Database::Redis);
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.database_configs.len(), 2);
+        assert_eq!(c.database_configs[0].database, Database::PostgreSQL);
+        assert_eq!(c.database_configs[1].database, Database::Redis);
+    }
+
+    // --- Select and expand ---
 
     #[test]
-    fn enter_on_postgres_expands() {
-        let mut h = DatabaseHandler::default();
+    fn enter_on_db_checks_and_expands() {
+        let mut h = with_cursor_on(Database::PostgreSQL);
         let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::PostgreSQL);
-        h.handle_input(key(KeyCode::Enter), &mut c);
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.is_selected(Database::PostgreSQL));
         assert_eq!(h.expanded, Some(Database::PostgreSQL));
         assert_eq!(h.focus, Focus::SubField(0));
     }
 
     #[test]
-    fn left_collapses_then_backs() {
+    fn space_deselects_checked_db() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(h.selected.is_empty());
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn space_on_unchecked_db_is_noop() {
+        let mut h = with_cursor_on(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(h.selected.is_empty());
+    }
+
+    #[test]
+    fn space_on_next_is_noop() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::PostgreSQL);
-        h.handle_input(key(KeyCode::Enter), &mut c); // expand
+        let result = h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.selected.is_empty());
+    }
+
+    // --- Left / collapse / back ---
+
+    #[test]
+    fn left_collapses_expanded_then_backs() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        assert!(h.expanded.is_some());
         h.focus = Focus::Choice;
-        let r = h.handle_input(key(KeyCode::Left), &mut c);
-        assert!(matches!(r, StepResult::Continue));
+        let result = h.handle_input(key(KeyCode::Left), &mut c);
         assert!(h.expanded.is_none());
-        let r = h.handle_input(key(KeyCode::Left), &mut c);
-        assert!(matches!(r, StepResult::Back));
+        assert!(matches!(result, StepResult::Continue));
+        let result = h.handle_input(key(KeyCode::Left), &mut c);
+        assert!(matches!(result, StepResult::Back));
+    }
+
+    #[test]
+    fn left_backs_when_nothing_expanded() {
+        let mut h = DatabaseHandler::default();
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Left), &mut c);
+        assert!(matches!(result, StepResult::Back));
+    }
+
+    // --- Esc ---
+
+    #[test]
+    fn esc_from_subfield_returns_to_choice() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        assert_eq!(h.focus, Focus::SubField(0));
+        h.handle_input(key(KeyCode::Esc), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+        assert_eq!(h.expanded, Some(Database::PostgreSQL));
+    }
+
+    // --- Up from row 0 ---
+
+    #[test]
+    fn up_from_row_zero_returns_to_choice() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        h.handle_input(key(KeyCode::Up), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+        assert_eq!(h.expanded, Some(Database::PostgreSQL));
     }
 
     // --- nav_rows shape ---
 
-    /// Build a handler whose `upstream_languages` snapshot reflects `langs`.
     fn handler_with_upstream(expanded: Database, langs: &[Language]) -> DatabaseHandler {
         let mut h = DatabaseHandler {
             expanded: Some(expanded),
             ..Default::default()
         };
+        h.scratch_mut_for(expanded);
         h.upstream_languages = langs.to_vec();
         h
     }
 
     #[test]
-    fn server_db_with_no_languages_has_run_mode_and_port() {
+    fn server_db_with_no_languages_has_run_mode_port_confirm() {
         let h = handler_with_upstream(Database::PostgreSQL, &[]);
         let rows = h.nav_rows();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(matches!(rows[0], DbNavRow::RunMode));
         assert!(matches!(rows[1], DbNavRow::Port));
+        assert!(matches!(rows[2], DbNavRow::Confirm));
     }
 
     #[test]
     fn server_db_with_python_includes_python_drivers() {
         let h = handler_with_upstream(Database::PostgreSQL, &[Language::Python]);
         let rows = h.nav_rows();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert!(matches!(rows[0], DbNavRow::RunMode));
-        assert!(matches!(rows[1], DbNavRow::Drivers { language: Language::Python, .. }));
+        assert!(matches!(
+            rows[1],
+            DbNavRow::Drivers {
+                language: Language::Python,
+                ..
+            }
+        ));
         assert!(matches!(rows[2], DbNavRow::Port));
+        assert!(matches!(rows[3], DbNavRow::Confirm));
     }
 
     #[test]
     fn sqlite_skips_run_mode_and_port() {
         let h = handler_with_upstream(Database::SQLite, &[Language::Python, Language::Rust]);
         let rows = h.nav_rows();
-        assert_eq!(rows.len(), 2);
-        assert!(matches!(rows[0], DbNavRow::Drivers { language: Language::Python, .. }));
-        assert!(matches!(rows[1], DbNavRow::Drivers { language: Language::Rust, .. }));
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(
+            rows[0],
+            DbNavRow::Drivers {
+                language: Language::Python,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rows[1],
+            DbNavRow::Drivers {
+                language: Language::Rust,
+                ..
+            }
+        ));
+        assert!(matches!(rows[2], DbNavRow::Confirm));
     }
 
     #[test]
     fn drivers_filtered_by_upstream_languages() {
-        // User selected only Rust upstream → Python driver row is omitted.
         let h = handler_with_upstream(Database::PostgreSQL, &[Language::Rust]);
         let rows = h.nav_rows();
         let driver_rows: Vec<_> = rows
@@ -852,87 +1153,97 @@ mod tests {
         assert_eq!(driver_rows.len(), 1);
         assert!(matches!(
             driver_rows[0],
-            DbNavRow::Drivers { language: Language::Rust, .. }
+            DbNavRow::Drivers {
+                language: Language::Rust,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn nav_rows_always_end_with_confirm() {
+        let h1 = handler_with_upstream(Database::PostgreSQL, &[]);
+        let rows1 = h1.nav_rows();
+        assert!(matches!(rows1.last(), Some(DbNavRow::Confirm)));
+
+        let h2 = handler_with_upstream(Database::SQLite, &[Language::Python]);
+        let rows2 = h2.nav_rows();
+        assert!(matches!(rows2.last(), Some(DbNavRow::Confirm)));
     }
 
     // --- Run mode interaction ---
 
     #[test]
     fn run_mode_left_right() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            ..Default::default()
-        };
+        let mut h = with_selected(Database::PostgreSQL);
         let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
         // Start: Docker. Right -> Native.
         h.handle_input(key(KeyCode::Right), &mut c);
-        assert_eq!(h.run_mode, RunMode::Native);
+        assert_eq!(h.current_run_mode(), RunMode::Native);
         // Right -> Managed.
         h.handle_input(key(KeyCode::Right), &mut c);
-        assert_eq!(h.run_mode, RunMode::Managed);
+        assert_eq!(h.current_run_mode(), RunMode::Managed);
         // Right at last is no-op.
         h.handle_input(key(KeyCode::Right), &mut c);
-        assert_eq!(h.run_mode, RunMode::Managed);
+        assert_eq!(h.current_run_mode(), RunMode::Managed);
         // Left -> Native.
         h.handle_input(key(KeyCode::Left), &mut c);
-        assert_eq!(h.run_mode, RunMode::Native);
+        assert_eq!(h.current_run_mode(), RunMode::Native);
         // Left -> Docker.
         h.handle_input(key(KeyCode::Left), &mut c);
-        assert_eq!(h.run_mode, RunMode::Docker);
+        assert_eq!(h.current_run_mode(), RunMode::Docker);
         // Left at first is no-op.
         h.handle_input(key(KeyCode::Left), &mut c);
-        assert_eq!(h.run_mode, RunMode::Docker);
+        assert_eq!(h.current_run_mode(), RunMode::Docker);
     }
 
     #[test]
     fn run_mode_space_cycles_with_wrap() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            run_mode: RunMode::Managed,
-            ..Default::default()
-        };
+        let mut h = with_selected(Database::PostgreSQL);
         let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        // Set to Managed via scratch
+        h.scratch_mut_for(Database::PostgreSQL).run_mode = Some(RunMode::Managed);
         h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert_eq!(h.run_mode, RunMode::Docker); // wraps
+        assert_eq!(h.current_run_mode(), RunMode::Docker); // wraps
     }
 
     // --- Driver toggling ---
 
     #[test]
     fn driver_space_toggles() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            row_cursor: 1, // RunMode + Drivers(Python) → row 1 = drivers
-            ..Default::default()
-        };
+        let mut h = with_selected(Database::PostgreSQL);
         let mut c = config_with_languages(&[Language::Python]);
-        // col 0 of Python drivers is psycopg.
-        h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert_eq!(h.drivers, vec![(Language::Python, "psycopg")]);
-        h.handle_input(key(KeyCode::Char(' ')), &mut c);
-        assert!(h.drivers.is_empty());
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        // Move to the first driver row
+        h.handle_input(key(KeyCode::Down), &mut c); // row 1 = Python drivers
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle psycopg
+        assert!(h.driver_checked(Language::Python, "psycopg"));
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // untoggle
+        assert!(!h.driver_checked(Language::Python, "psycopg"));
     }
 
     #[test]
-    fn driver_left_right_moves_col_cursor() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            row_cursor: 1,
-            ..Default::default()
-        };
+    fn enter_on_driver_row_toggles_not_advances() {
+        let mut h = with_selected(Database::PostgreSQL);
         let mut c = config_with_languages(&[Language::Python]);
-        assert_eq!(h.col_cursor, 0);
         h.handle_input(key(KeyCode::Right), &mut c);
-        assert_eq!(h.col_cursor, 1);
-        h.handle_input(key(KeyCode::Left), &mut c);
-        assert_eq!(h.col_cursor, 0);
-        h.handle_input(key(KeyCode::Left), &mut c); // clamped at 0
-        assert_eq!(h.col_cursor, 0);
+        h.handle_input(key(KeyCode::Down), &mut c); // driver row
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(h.driver_checked(Language::Python, "psycopg"));
+        assert_eq!(h.focus, Focus::SubField(0)); // still in sub-panel
+    }
+
+    #[test]
+    fn enter_on_run_mode_cycles() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c); // expand, row 0 = RunMode
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.current_run_mode(), RunMode::Native); // cycled from Docker
     }
 
     // --- Port validation ---
@@ -966,184 +1277,256 @@ mod tests {
         assert!(port_problem("100000").is_some());
     }
 
+    // --- Confirm button ---
+
     #[test]
-    fn enter_with_invalid_port_does_not_advance() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            row_cursor: 1, // no upstream langs → rows = [RunMode, Port]
-            ..Default::default()
-        };
+    fn confirm_button_collapses_via_enter() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let rows = h.nav_rows();
+        h.row_cursor = rows.len() - 1; // Confirm row
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+        assert!(h.is_selected(Database::PostgreSQL));
+    }
+
+    #[test]
+    fn confirm_button_collapses_via_space() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let rows = h.nav_rows();
+        h.row_cursor = rows.len() - 1;
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn confirm_blocked_with_invalid_port() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
         h.port_input.set_value("99999");
-        let mut c = ProjectConfig::default();
-        let r = h.handle_input(key(KeyCode::Enter), &mut c);
-        assert!(matches!(r, StepResult::Continue));
-        assert!(c.database.database.is_none(), "config should not be committed");
-    }
-
-    #[test]
-    fn enter_with_valid_port_commits_and_advances() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            row_cursor: 1,
-            ..Default::default()
-        };
-        h.port_input.set_value("5433");
-        let mut c = ProjectConfig::default();
-        let r = h.handle_input(key(KeyCode::Enter), &mut c);
-        assert!(matches!(r, StepResult::Done));
-        assert_eq!(c.database.database, Some(Database::PostgreSQL));
-        assert_eq!(c.database.run_mode, Some(RunMode::Docker));
-        assert_eq!(c.database.port, "5433");
-    }
-
-    #[test]
-    fn enter_with_empty_port_commits() {
-        let mut h = DatabaseHandler {
-            expanded: Some(Database::PostgreSQL),
-            focus: Focus::SubField(0),
-            row_cursor: 1,
-            ..Default::default()
-        };
-        let mut c = ProjectConfig::default();
-        let r = h.handle_input(key(KeyCode::Enter), &mut c);
-        assert!(matches!(r, StepResult::Done));
-        assert_eq!(c.database.database, Some(Database::PostgreSQL));
-        assert!(c.database.port.is_empty());
-    }
-
-    // --- SQLite commit ---
-
-    #[test]
-    fn sqlite_commits_without_port_or_run_mode() {
-        let mut h = DatabaseHandler::default();
-        let mut c = config_with_languages(&[Language::Rust]);
-        h.cursor = cursor_for(Database::SQLite);
-        h.handle_input(key(KeyCode::Enter), &mut c); // expand
-        let r = h.handle_input(key(KeyCode::Enter), &mut c); // commit immediately
-        assert!(matches!(r, StepResult::Done));
-        assert_eq!(c.database.database, Some(Database::SQLite));
-        assert!(c.database.run_mode.is_none());
-        assert!(c.database.port.is_empty());
-    }
-
-    // --- Esc returns to choice ---
-
-    #[test]
-    fn esc_returns_to_choice() {
-        let mut h = DatabaseHandler::default();
-        let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::PostgreSQL);
+        let rows = h.nav_rows();
+        h.row_cursor = rows.len() - 1;
         h.handle_input(key(KeyCode::Enter), &mut c);
+        assert_eq!(h.expanded, Some(Database::PostgreSQL), "Confirm should not collapse");
+    }
+
+    // --- Next blocked with invalid port ---
+
+    #[test]
+    fn next_blocked_when_selected_db_has_invalid_port() {
+        let mut h = with_selected(Database::PostgreSQL);
+        h.scratch_mut_for(Database::PostgreSQL).port = "99999".to_string();
+        let mut c = ProjectConfig::default();
+        h.cursor = 0; // Next
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert!(c.database_configs.is_empty());
+    }
+
+    #[test]
+    fn next_advances_when_invalid_port_db_is_unchecked() {
+        let mut h = DatabaseHandler::default();
+        // Add scratch with bad port but don't select the DB
+        h.scratch_mut_for(Database::PostgreSQL).port = "99999".to_string();
+        let mut c = ProjectConfig::default();
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+    }
+
+    // --- Port text input ---
+
+    #[test]
+    fn enter_on_port_row_collapses() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        // Find the port row
+        let rows = h.nav_rows();
+        let port_row = rows
+            .iter()
+            .position(|r| matches!(r, DbNavRow::Port))
+            .unwrap();
+        h.row_cursor = port_row;
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.focus, Focus::Choice);
+        assert!(h.expanded.is_none());
+    }
+
+    #[test]
+    fn enter_on_port_with_invalid_value_does_not_collapse() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let rows = h.nav_rows();
+        let port_row = rows
+            .iter()
+            .position(|r| matches!(r, DbNavRow::Port))
+            .unwrap();
+        h.row_cursor = port_row;
+        // Type invalid port
+        for ch in "99999".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(h.expanded, Some(Database::PostgreSQL)); // still expanded
+    }
+
+    #[test]
+    fn port_chars_are_captured() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = ProjectConfig::default();
+        h.handle_input(key(KeyCode::Right), &mut c);
+        let rows = h.nav_rows();
+        let port_row = rows
+            .iter()
+            .position(|r| matches!(r, DbNavRow::Port))
+            .unwrap();
+        h.row_cursor = port_row;
+        for ch in "5433".chars() {
+            h.handle_input(key(KeyCode::Char(ch)), &mut c);
+        }
+        assert_eq!(h.port_input.value(), "5433");
+        // Scratch is synced
+        assert_eq!(h.scratch_for(Database::PostgreSQL).unwrap().port, "5433");
+    }
+
+    // --- Full flow ---
+
+    #[test]
+    fn full_flow_configure_and_advance() {
+        let mut h = with_cursor_on(Database::PostgreSQL);
+        let mut c = config_with_languages(&[Language::Python]);
+        // Enter: check + expand
+        h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(h.is_selected(Database::PostgreSQL));
         assert_eq!(h.focus, Focus::SubField(0));
-        h.handle_input(key(KeyCode::Esc), &mut c);
+        // Toggle a driver
+        h.handle_input(key(KeyCode::Down), &mut c); // driver row
+        h.handle_input(key(KeyCode::Char(' ')), &mut c);
+        // Navigate to Confirm
+        let rows = h.nav_rows();
+        h.row_cursor = rows.len() - 1;
+        h.handle_input(key(KeyCode::Enter), &mut c); // collapse
         assert_eq!(h.focus, Focus::Choice);
-        assert_eq!(h.expanded, Some(Database::PostgreSQL));
+        // Navigate up to Next
+        for _ in 0..20 {
+            h.handle_input(key(KeyCode::Up), &mut c);
+        }
+        assert_eq!(h.cursor, 0);
+        // Enter on Next: commit + advance
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.database_configs.len(), 1);
+        assert_eq!(
+            c.database_configs[0].database,
+            Database::PostgreSQL
+        );
     }
 
-    // --- Up from row 0 returns to choice ---
-
     #[test]
-    fn up_from_row_zero_returns_to_choice() {
+    fn multi_select_two_databases() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
-        h.cursor = cursor_for(Database::PostgreSQL);
+        // Select PostgreSQL
+        h.cursor = DB_CHOICES.iter().position(|d| *d == Database::PostgreSQL).unwrap() + 1;
+        h.handle_input(key(KeyCode::Enter), &mut c); // check + expand
+        h.handle_input(key(KeyCode::Esc), &mut c); // back to choice
+        // Select Redis
+        h.cursor = DB_CHOICES.iter().position(|d| *d == Database::Redis).unwrap() + 1;
         h.handle_input(key(KeyCode::Enter), &mut c);
-        h.handle_input(key(KeyCode::Up), &mut c);
-        assert_eq!(h.focus, Focus::Choice);
-        assert_eq!(h.expanded, Some(Database::PostgreSQL));
+        h.handle_input(key(KeyCode::Esc), &mut c);
+        assert_eq!(h.selected.len(), 2);
+        // Next
+        h.cursor = 0;
+        let result = h.handle_input(key(KeyCode::Enter), &mut c);
+        assert!(matches!(result, StepResult::Done));
+        assert_eq!(c.database_configs.len(), 2);
+    }
+
+    // --- Uncheck then recheck preserves scratch ---
+
+    #[test]
+    fn uncheck_then_recheck_preserves_scratch() {
+        let mut h = with_selected(Database::PostgreSQL);
+        let mut c = config_with_languages(&[Language::Python]);
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        h.handle_input(key(KeyCode::Down), &mut c); // driver row
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // toggle driver
+        h.handle_input(key(KeyCode::Esc), &mut c); // back to choice
+        h.handle_input(key(KeyCode::Left), &mut c); // collapse
+        h.handle_input(key(KeyCode::Char(' ')), &mut c); // uncheck
+        assert!(!h.is_selected(Database::PostgreSQL));
+        assert!(h.scratch_for(Database::PostgreSQL).unwrap().drivers.len() == 1);
+        h.handle_input(key(KeyCode::Enter), &mut c); // re-check via Enter (also expands)
+        assert!(h.is_selected(Database::PostgreSQL));
+        assert!(h.scratch_for(Database::PostgreSQL).unwrap().drivers.len() == 1);
+    }
+
+    // --- Restore ---
+
+    #[test]
+    fn restore_from_config_rehydrates() {
+        let mut h = DatabaseHandler::default();
+        let c = ProjectConfig {
+            database_configs: vec![DatabaseConfig {
+                database: Database::MySQL,
+                run_mode: Some(RunMode::Native),
+                drivers: vec![(Language::Python, "pymysql")],
+                port: "3307".to_string(),
+            }],
+            ..Default::default()
+        };
+        h.restore_from_config(&c);
+        assert_eq!(h.selected, vec![Database::MySQL]);
+        assert_eq!(h.scratch.len(), 1);
+        assert_eq!(h.scratch[0].run_mode, Some(RunMode::Native));
+        assert_eq!(h.scratch[0].drivers, vec![(Language::Python, "pymysql")]);
+        assert_eq!(h.scratch[0].port, "3307");
     }
 
     // --- Tab cycling ---
 
     #[test]
     fn tab_cycles_flat_positions() {
-        let mut h = DatabaseHandler::default();
+        let mut h = with_selected(Database::PostgreSQL);
         let mut c = config_with_languages(&[Language::Python]);
-        h.cursor = cursor_for(Database::PostgreSQL);
-        h.handle_input(key(KeyCode::Enter), &mut c); // expand → SubField(0)
-        // RunMode has 3 cols → 3 flat positions; Drivers(Python) has 4 → 4
-        // positions; Port has 1 → total 8.
+        h.handle_input(key(KeyCode::Right), &mut c); // expand
+        // RunMode(3) + Drivers(4) + Port(1) + Confirm(1) = 9 flat positions
         let mut seen = vec![(h.row_cursor, h.col_cursor)];
-        for _ in 0..7 {
+        for _ in 0..8 {
             h.handle_input(key(KeyCode::Tab), &mut c);
             seen.push((h.row_cursor, h.col_cursor));
         }
-        assert_eq!(seen.len(), 8);
+        assert_eq!(seen.len(), 9);
         h.handle_input(key(KeyCode::Tab), &mut c);
-        // Wraps back to (0, 0).
-        assert_eq!((h.row_cursor, h.col_cursor), (0, 0));
-    }
-
-    // --- Restore from config ---
-
-    #[test]
-    fn restore_re_expands_previously_selected_db() {
-        let mut h = DatabaseHandler::default();
-        let c = ProjectConfig {
-            database: DatabaseConfig {
-                database: Some(Database::MySQL),
-                run_mode: Some(RunMode::Native),
-                drivers: vec![(Language::Python, "pymysql")],
-                port: "3307".to_string(),
-            },
-            ..Default::default()
-        };
-        h.restore_from_config(&c);
-        assert_eq!(h.cursor, cursor_for(Database::MySQL));
-        assert_eq!(h.expanded, Some(Database::MySQL));
-        assert_eq!(h.focus, Focus::SubField(0));
-        assert_eq!(h.run_mode, RunMode::Native);
-        assert_eq!(h.drivers, vec![(Language::Python, "pymysql")]);
-        assert_eq!(h.port_input.value(), "3307");
-    }
-
-    #[test]
-    fn restore_skips_expand_for_none() {
-        let mut h = DatabaseHandler::default();
-        let c = ProjectConfig {
-            database: DatabaseConfig {
-                database: Some(Database::None),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        h.restore_from_config(&c);
-        assert_eq!(h.cursor, cursor_for(Database::None));
-        assert!(h.expanded.is_none());
-        assert_eq!(h.focus, Focus::Choice);
+        assert_eq!((h.row_cursor, h.col_cursor), (0, 0)); // wraps
     }
 
     // --- Quit ---
 
     #[test]
-    fn q_in_choice_quits() {
+    fn q_quits() {
         let mut h = DatabaseHandler::default();
         let mut c = ProjectConfig::default();
-        let r = h.handle_input(key(KeyCode::Char('q')), &mut c);
-        assert!(matches!(r, StepResult::Quit));
+        let result = h.handle_input(key(KeyCode::Char('q')), &mut c);
+        assert!(matches!(result, StepResult::Quit));
     }
 
     // --- planned_actions ---
 
     #[test]
-    fn planned_actions_database_unset() {
+    fn planned_actions_empty_when_no_databases() {
         let h = DatabaseHandler::default();
         let c = ProjectConfig::default();
-        assert!(h.planned_actions(&c).is_empty());
-    }
-
-    #[test]
-    fn planned_actions_database_none() {
-        let h = DatabaseHandler::default();
-        let c = ProjectConfig {
-            database: DatabaseConfig {
-                database: Some(Database::None),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
         assert!(h.planned_actions(&c).is_empty());
     }
 
@@ -1151,21 +1534,23 @@ mod tests {
     fn planned_actions_postgres_with_drivers() {
         let h = DatabaseHandler::default();
         let c = ProjectConfig {
-            database: DatabaseConfig {
-                database: Some(Database::PostgreSQL),
+            database_configs: vec![DatabaseConfig {
+                database: Database::PostgreSQL,
                 run_mode: Some(RunMode::Docker),
                 drivers: vec![(Language::Python, "psycopg"), (Language::Rust, "sqlx")],
                 port: String::new(),
-            },
+            }],
             ..Default::default()
         };
         let actions = h.planned_actions(&c);
         assert!(actions[0].contains("PostgreSQL"));
         assert!(actions.iter().any(|a| a.contains("Docker")));
-        assert!(actions.iter().any(|a| a.contains("psycopg") && a.contains("sqlx")));
+        assert!(actions
+            .iter()
+            .any(|a| a.contains("psycopg") && a.contains("sqlx")));
     }
 
-    // --- execute is a no-op ---
+    // --- execute ---
 
     #[test]
     fn execute_is_ok() {

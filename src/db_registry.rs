@@ -8,55 +8,48 @@
 use crate::{Database, Language};
 
 /// Static description of a database choice. `None` means the database doesn't
-/// expose that knob (SQLite has no port and no run mode; the `Database::None`
-/// variant has nothing).
-pub struct DatabaseSpec {
+/// expose that knob (e.g. SQLite has no port and no run mode).
+pub(crate) struct DatabaseSpec {
     /// Default port to display when the user leaves the port input empty.
-    /// `None` for embedded databases (SQLite) and the `None` variant.
-    pub default_port: Option<u16>,
+    /// `None` for embedded databases (SQLite).
+    pub(crate) default_port: Option<u16>,
     /// Whether the database asks the user how it should be run (Docker /
-    /// Native / Managed). `false` for SQLite (always embedded) and `None`.
-    pub supports_run_mode: bool,
+    /// Native / Managed). `false` for SQLite (always embedded).
+    pub(crate) supports_run_mode: bool,
     /// Per-language driver catalogs. Languages not represented here have no
     /// drivers for this DB; the handler also filters this list down to the
     /// languages the user actually selected upstream.
-    pub driver_groups: &'static [DriverGroup],
+    pub(crate) driver_groups: &'static [DriverGroup],
 }
 
-pub struct DriverGroup {
-    pub language: Language,
-    pub drivers: &'static [Driver],
+pub(crate) struct DriverGroup {
+    pub(crate) language: Language,
+    pub(crate) drivers: &'static [Driver],
 }
 
-pub struct Driver {
+pub(crate) struct Driver {
     /// Stable identifier — typically the canonical PyPI / crates.io name.
     /// Pairs with [`Language`] in [`crate::DatabaseConfig::drivers`] to avoid
     /// cross-ecosystem ID collisions (e.g. Python `redis` vs Rust `redis`).
-    pub id: &'static str,
-    pub label: &'static str,
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
 }
 
-pub const EMPTY_DB_SPEC: DatabaseSpec = DatabaseSpec {
-    default_port: None,
-    supports_run_mode: false,
-    driver_groups: &[],
-};
-
-pub fn spec_for(database: Database) -> &'static DatabaseSpec {
+// Exhaustive — new Database variants must add a spec here.
+pub(crate) fn spec_for(database: Database) -> &'static DatabaseSpec {
     match database {
         Database::PostgreSQL => &POSTGRESQL_SPEC,
         Database::MySQL => &MYSQL_SPEC,
         Database::SQLite => &SQLITE_SPEC,
         Database::MongoDB => &MONGODB_SPEC,
         Database::Redis => &REDIS_SPEC,
-        Database::None => &EMPTY_DB_SPEC,
     }
 }
 
 /// Look up a driver record by `(language, id)`. Walks every database's
 /// catalog, so the same `(Python, "sqlalchemy")` pair resolves regardless
 /// of which DB the user is configuring. Returns `None` for unknown IDs.
-pub fn driver_by_id(language: Language, id: &str) -> Option<&'static Driver> {
+pub(crate) fn driver_by_id(language: Language, id: &str) -> Option<&'static Driver> {
     for db in [
         Database::PostgreSQL,
         Database::MySQL,
@@ -96,7 +89,7 @@ const POSTGRESQL_GROUPS: &[DriverGroup] = &[
     DriverGroup { language: Language::Python, drivers: POSTGRESQL_PYTHON },
     DriverGroup { language: Language::Rust,   drivers: POSTGRESQL_RUST },
 ];
-pub const POSTGRESQL_SPEC: DatabaseSpec = DatabaseSpec {
+const POSTGRESQL_SPEC: DatabaseSpec = DatabaseSpec {
     default_port: Some(5432),
     supports_run_mode: true,
     driver_groups: POSTGRESQL_GROUPS,
@@ -120,7 +113,7 @@ const MYSQL_GROUPS: &[DriverGroup] = &[
     DriverGroup { language: Language::Python, drivers: MYSQL_PYTHON },
     DriverGroup { language: Language::Rust,   drivers: MYSQL_RUST },
 ];
-pub const MYSQL_SPEC: DatabaseSpec = DatabaseSpec {
+const MYSQL_SPEC: DatabaseSpec = DatabaseSpec {
     default_port: Some(3306),
     supports_run_mode: true,
     driver_groups: MYSQL_GROUPS,
@@ -141,7 +134,7 @@ const SQLITE_GROUPS: &[DriverGroup] = &[
     DriverGroup { language: Language::Python, drivers: SQLITE_PYTHON },
     DriverGroup { language: Language::Rust,   drivers: SQLITE_RUST },
 ];
-pub const SQLITE_SPEC: DatabaseSpec = DatabaseSpec {
+const SQLITE_SPEC: DatabaseSpec = DatabaseSpec {
     default_port: None,
     supports_run_mode: false,
     driver_groups: SQLITE_GROUPS,
@@ -161,7 +154,7 @@ const MONGODB_GROUPS: &[DriverGroup] = &[
     DriverGroup { language: Language::Python, drivers: MONGODB_PYTHON },
     DriverGroup { language: Language::Rust,   drivers: MONGODB_RUST },
 ];
-pub const MONGODB_SPEC: DatabaseSpec = DatabaseSpec {
+const MONGODB_SPEC: DatabaseSpec = DatabaseSpec {
     default_port: Some(27017),
     supports_run_mode: true,
     driver_groups: MONGODB_GROUPS,
@@ -181,7 +174,7 @@ const REDIS_GROUPS: &[DriverGroup] = &[
     DriverGroup { language: Language::Python, drivers: REDIS_PYTHON },
     DriverGroup { language: Language::Rust,   drivers: REDIS_RUST },
 ];
-pub const REDIS_SPEC: DatabaseSpec = DatabaseSpec {
+const REDIS_SPEC: DatabaseSpec = DatabaseSpec {
     default_port: Some(6379),
     supports_run_mode: true,
     driver_groups: REDIS_GROUPS,
@@ -206,14 +199,6 @@ mod tests {
         assert!(s.default_port.is_none());
         assert!(!s.supports_run_mode);
         assert!(!s.driver_groups.is_empty());
-    }
-
-    #[test]
-    fn spec_for_none_is_empty() {
-        let s = spec_for(Database::None);
-        assert!(s.default_port.is_none());
-        assert!(!s.supports_run_mode);
-        assert!(s.driver_groups.is_empty());
     }
 
     #[test]

@@ -40,14 +40,14 @@ pub struct ProjectConfig {
     jj_colocate: bool,
     language_configs: Vec<LanguageConfig>,
     workflows: WorkflowConfig,
-    database: DatabaseConfig,
+    database_configs: Vec<DatabaseConfig>,
     remotes: Vec<Remote>,
     extras: Vec<Extra>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DatabaseConfig {
-    pub(crate) database: Option<Database>,
+    pub(crate) database: Database,
     /// `Some(_)` only when `database` supports a run mode (server DBs).
     /// SQLite and `None` always have `run_mode == None`.
     pub(crate) run_mode: Option<RunMode>,
@@ -58,6 +58,21 @@ pub struct DatabaseConfig {
     /// Empty = "use the database's default port". Validated by
     /// `port_problem`; out-of-range values block Enter from advancing.
     pub(crate) port: String,
+}
+
+impl DatabaseConfig {
+    pub(crate) fn default_for(database: Database, supports_run_mode: bool) -> Self {
+        Self {
+            database,
+            run_mode: if supports_run_mode {
+                Some(RunMode::Docker)
+            } else {
+                None
+            },
+            drivers: Vec::new(),
+            port: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
@@ -133,7 +148,7 @@ impl WizardStep {
             Self::Vcs => Vcs::VARIANTS.len(),
             Self::Languages => Language::VARIANTS.len(),
             Self::Workflows => 0,
-            Self::Database => Database::VARIANTS.len(),
+            Self::Database => 0,
             Self::Remotes => Remote::VARIANTS.len(),
             Self::Extras => Extra::VARIANTS.len(),
             Self::Summary => 0,
@@ -181,7 +196,6 @@ enum Database {
     SQLite,
     MongoDB,
     Redis,
-    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
@@ -481,17 +495,16 @@ impl App {
         lines.push("Workflows:".to_string());
         lines.push(format!("  CI: {ci}"));
         lines.push(format!("  Pre-commit: {pre}"));
-        // Database (multi-line for selected DB; includes run mode, port, drivers per language)
-        let db = &c.database;
-        match db.database {
-            None => lines.push("Database: —".to_string()),
-            Some(Database::None) => lines.push("Database: None".to_string()),
-            Some(database) => {
-                lines.push(format!("Database: {database}"));
+        // Database (multi-line per selected DB; includes run mode, port, drivers per language)
+        if c.database_configs.is_empty() {
+            lines.push("Database: None".to_string());
+        } else {
+            for db in &c.database_configs {
+                lines.push(format!("Database: {}", db.database));
                 if let Some(rm) = db.run_mode {
                     lines.push(format!("  Run mode: {rm}"));
                 }
-                let spec = db_registry::spec_for(database);
+                let spec = db_registry::spec_for(db.database);
                 if let Some(default_port) = spec.default_port {
                     let port_display = if db.port.is_empty() {
                         format!("{default_port} (default)")
@@ -502,26 +515,13 @@ impl App {
                 }
                 if !db.drivers.is_empty() {
                     lines.push("  Drivers:".to_string());
-                    for lang in [
-                        Language::Rust,
-                        Language::Python,
-                        Language::Go,
-                        Language::JavaScript,
-                        Language::TypeScript,
-                        Language::Java,
-                        Language::CSharp,
-                        Language::Cpp,
-                        Language::Ruby,
-                        Language::Zig,
-                        Language::Haskell,
-                        Language::Lua,
-                    ] {
+                    for lang in Language::VARIANTS {
                         let labels: Vec<&'static str> = db
                             .drivers
                             .iter()
-                            .filter(|(l, _)| *l == lang)
+                            .filter(|(l, _)| *l == *lang)
                             .filter_map(|(_, id)| {
-                                db_registry::driver_by_id(lang, id).map(|d| d.label)
+                                db_registry::driver_by_id(*lang, id).map(|d| d.label)
                             })
                             .collect();
                         if !labels.is_empty() {
@@ -665,7 +665,7 @@ impl App {
     }
 
     /// Returns the `StepHandler` trait object for the current step, if one exists.
-    /// Steps that are still inline in `main.rs` (Database, Remotes, Extras, Summary)
+    /// Steps that are still inline in `main.rs` (Remotes, Extras, Summary)
     /// return `None`; they'll return `Some` once extracted.
     fn current_handler(&self) -> Option<&dyn StepHandler> {
         match self.current_step() {
@@ -810,10 +810,7 @@ mod tests {
         assert!(c.language_configs.is_empty());
         assert!(c.workflows.ci.is_none());
         assert!(c.workflows.pre_commit.is_none());
-        assert!(c.database.database.is_none());
-        assert!(c.database.run_mode.is_none());
-        assert!(c.database.drivers.is_empty());
-        assert!(c.database.port.is_empty());
+        assert!(c.database_configs.is_empty());
         assert!(c.remotes.is_empty());
         assert!(c.extras.is_empty());
     }
@@ -831,7 +828,7 @@ mod tests {
         c.vcs = Some(Vcs::Git);
         c.default_branch = "develop".to_string();
         assert_eq!(c.project_name, "test");
-        assert!(c.database.database.is_none());
+        assert!(c.database_configs.is_empty());
     }
 
     // --- Enum Display (strum) ---
@@ -870,7 +867,7 @@ mod tests {
         assert_eq!(WizardStep::ProjectType.option_count(), ProjectType::VARIANTS.len());
         assert_eq!(WizardStep::Vcs.option_count(), Vcs::VARIANTS.len());
         assert_eq!(WizardStep::Languages.option_count(), Language::VARIANTS.len());
-        assert_eq!(WizardStep::Database.option_count(), Database::VARIANTS.len());
+        assert_eq!(WizardStep::Database.option_count(), 0);
         assert_eq!(WizardStep::Remotes.option_count(), Remote::VARIANTS.len());
         assert_eq!(WizardStep::Extras.option_count(), Extra::VARIANTS.len());
         assert_eq!(WizardStep::Summary.option_count(), 0);
@@ -1050,12 +1047,12 @@ mod tests {
     #[test]
     fn summary_shows_database_block() {
         let mut app = App::default();
-        app.config.database = DatabaseConfig {
-            database: Some(Database::PostgreSQL),
+        app.config.database_configs = vec![DatabaseConfig {
+            database: Database::PostgreSQL,
             run_mode: Some(RunMode::Docker),
             drivers: vec![(Language::Python, "psycopg"), (Language::Rust, "sqlx")],
             port: "5433".to_string(),
-        };
+        }];
         let summary = app.config_summary();
         assert!(summary.contains("Database: PostgreSQL"));
         assert!(summary.contains("Run mode: Docker"));
@@ -1067,34 +1064,21 @@ mod tests {
     #[test]
     fn summary_shows_database_default_port_when_empty() {
         let mut app = App::default();
-        app.config.database = DatabaseConfig {
-            database: Some(Database::PostgreSQL),
+        app.config.database_configs = vec![DatabaseConfig {
+            database: Database::PostgreSQL,
             run_mode: Some(RunMode::Docker),
             drivers: vec![],
             port: String::new(),
-        };
+        }];
         let summary = app.config_summary();
         assert!(summary.contains("Port: 5432 (default)"));
     }
 
     #[test]
-    fn summary_shows_database_none_inline() {
-        let mut app = App::default();
-        app.config.database = DatabaseConfig {
-            database: Some(Database::None),
-            ..Default::default()
-        };
-        let summary = app.config_summary();
-        assert!(summary.contains("Database: None"));
-        assert!(!summary.contains("Run mode"));
-        assert!(!summary.contains("Port:"));
-    }
-
-    #[test]
-    fn summary_shows_database_dash_when_unset() {
+    fn summary_shows_database_none_when_empty() {
         let app = App::default();
         let summary = app.config_summary();
-        assert!(summary.contains("Database: —"));
+        assert!(summary.contains("Database: None"));
     }
 
     #[test]
