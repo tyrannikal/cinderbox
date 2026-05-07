@@ -151,7 +151,19 @@ impl DatabaseHandler {
         self.expanded = Some(db);
         self.focus = Focus::SubField(0);
         self.row_cursor = 0;
-        self.col_cursor = 0;
+        let spec = db_registry::spec_for(db);
+        self.col_cursor = if spec.supports_run_mode {
+            let run_mode = self
+                .scratch_for(db)
+                .and_then(|s| s.run_mode)
+                .unwrap_or(RunMode::Docker);
+            RUN_MODE_CHOICES
+                .iter()
+                .position(|m| *m == run_mode)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         self.port_input = TextInput::new("Port");
         self.port_input.set_value(port_value);
     }
@@ -468,6 +480,7 @@ impl DatabaseHandler {
                     && let Some(db) = self.expanded
                 {
                     self.scratch_mut_for(db).run_mode = Some(RUN_MODE_CHOICES[idx - 1]);
+                    self.col_cursor = idx - 1;
                 }
                 StepResult::Continue
             }
@@ -481,6 +494,7 @@ impl DatabaseHandler {
                     && let Some(db) = self.expanded
                 {
                     self.scratch_mut_for(db).run_mode = Some(RUN_MODE_CHOICES[idx + 1]);
+                    self.col_cursor = idx + 1;
                 }
                 StepResult::Continue
             }
@@ -490,9 +504,10 @@ impl DatabaseHandler {
                     .iter()
                     .position(|m| *m == run_mode)
                     .unwrap_or(0);
-                let next = RUN_MODE_CHOICES[(idx + 1) % RUN_MODE_CHOICES.len()];
+                let next_idx = (idx + 1) % RUN_MODE_CHOICES.len();
                 if let Some(db) = self.expanded {
-                    self.scratch_mut_for(db).run_mode = Some(next);
+                    self.scratch_mut_for(db).run_mode = Some(RUN_MODE_CHOICES[next_idx]);
+                    self.col_cursor = next_idx;
                 }
                 StepResult::Continue
             }

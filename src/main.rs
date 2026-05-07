@@ -17,8 +17,8 @@ mod widgets;
 
 use steps::{
     CURSOR_BLANK, CURSOR_MARKER, StepHandler, StepResult, database::DatabaseHandler,
-    languages::LanguagesHandler, project_type::ProjectTypeHandler, vcs::VcsHandler,
-    workflows::WorkflowsHandler,
+    languages::LanguagesHandler, project_type::ProjectTypeHandler, remotes::RemotesHandler,
+    vcs::VcsHandler, workflows::WorkflowsHandler,
 };
 
 fn main() -> io::Result<()> {
@@ -41,7 +41,7 @@ pub struct ProjectConfig {
     language_configs: Vec<LanguageConfig>,
     workflows: WorkflowConfig,
     database_configs: Vec<DatabaseConfig>,
-    remotes: Vec<Remote>,
+    remotes: Vec<RemoteConfig>,
     extras: Vec<Extra>,
 }
 
@@ -149,7 +149,7 @@ impl WizardStep {
             Self::Languages => Language::VARIANTS.len(),
             Self::Workflows => 0,
             Self::Database => 0,
-            Self::Remotes => Remote::VARIANTS.len(),
+            Self::Remotes => 0,
             Self::Extras => Extra::VARIANTS.len(),
             Self::Summary => 0,
         }
@@ -199,13 +199,34 @@ enum Database {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
-enum Remote {
+pub enum RemoteProvider {
     GitHub,
     Codeberg,
     GitLab,
     Bitbucket,
     #[strum(to_string = "Self-hosted")]
     SelfHosted,
+}
+
+impl RemoteProvider {
+    pub(crate) fn url_prefix(self) -> &'static str {
+        match self {
+            Self::GitHub => "git@github.com:",
+            Self::Codeberg => "git@codeberg.org:",
+            Self::GitLab => "git@gitlab.com:",
+            Self::Bitbucket => "git@bitbucket.org:",
+            Self::SelfHosted => "",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteConfig {
+    pub(crate) provider: RemoteProvider,
+    pub(crate) name: String,
+    pub(crate) location: String,
+    pub(crate) fetch: bool,
+    pub(crate) push: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, VariantArray, Display)]
@@ -222,7 +243,6 @@ struct App {
     step_index: usize,
     cursor: usize,
     config: ProjectConfig,
-    selected_remotes: Vec<Remote>,
     selected_extras: Vec<Extra>,
     confirmed: bool,
     exit: bool,
@@ -231,6 +251,7 @@ struct App {
     languages_handler: LanguagesHandler,
     workflows_handler: WorkflowsHandler,
     database_handler: DatabaseHandler,
+    remotes_handler: RemotesHandler,
 }
 
 impl App {
@@ -246,6 +267,7 @@ impl App {
             self.languages_handler.execute(&self.config)?;
             self.workflows_handler.execute(&self.config)?;
             self.database_handler.execute(&self.config)?;
+            self.remotes_handler.execute(&self.config)?;
         }
         Ok(())
     }
@@ -272,7 +294,7 @@ impl App {
             instruction_spans.push("<←/H> ".blue().bold());
         }
         match self.current_step() {
-            WizardStep::Remotes | WizardStep::Extras => {
+            WizardStep::Extras => {
                 instruction_spans.push(" Toggle ".into());
                 instruction_spans.push("<Enter> ".blue().bold());
                 instruction_spans.push(" Confirm ".into());
@@ -349,6 +371,11 @@ impl App {
                 frame.render_widget(wizard_block, wizard_area);
                 self.database_handler.render(frame, inner);
             }
+            WizardStep::Remotes => {
+                let inner = wizard_block.inner(wizard_area);
+                frame.render_widget(wizard_block, wizard_area);
+                self.remotes_handler.render(frame, inner);
+            }
             _ => {
                 let content = self.step_content();
                 let wizard = Paragraph::new(content).block(wizard_block);
@@ -393,9 +420,7 @@ impl App {
             WizardStep::Languages => String::new(),    // handled by LanguagesHandler
             WizardStep::Workflows => String::new(),    // handled by WorkflowsHandler
             WizardStep::Database => String::new(),     // handled by DatabaseHandler
-            WizardStep::Remotes => {
-                self.render_multi_select_list(Remote::VARIANTS, &self.selected_remotes)
-            }
+            WizardStep::Remotes => String::new(), // handled by RemotesHandler
             WizardStep::Extras => {
                 self.render_multi_select_list(Extra::VARIANTS, &self.selected_extras)
             }
@@ -531,7 +556,20 @@ impl App {
                 }
             }
         }
-        lines.push(Self::format_config_list("Remotes", &c.remotes, "—"));
+        if c.remotes.is_empty() {
+            lines.push("Remotes: —".to_string());
+        } else {
+            lines.push("Remotes:".to_string());
+            for r in &c.remotes {
+                let ops = match (r.fetch, r.push) {
+                    (true, true) => "fetch+push",
+                    (true, false) => "fetch-only",
+                    (false, true) => "push-only",
+                    _ => "",
+                };
+                lines.push(format!("  {} ({}) → {} [{ops}]", r.name, r.provider, r.location));
+            }
+        }
         lines.push(Self::format_config_list("Extras", &c.extras, "—"));
         lines
     }
@@ -554,6 +592,7 @@ impl App {
         actions.extend(self.languages_handler.planned_actions(&self.config));
         actions.extend(self.workflows_handler.planned_actions(&self.config));
         actions.extend(self.database_handler.planned_actions(&self.config));
+        actions.extend(self.remotes_handler.planned_actions(&self.config));
         if !actions.is_empty() {
             lines.push(String::new());
             lines.push("Planned actions:".to_string());
@@ -640,6 +679,15 @@ impl App {
                         }
                         return Ok(());
                     }
+                    WizardStep::Remotes => {
+                        match self.remotes_handler.handle_input(key, &mut self.config) {
+                            StepResult::Done => self.next(),
+                            StepResult::Back => self.prev(),
+                            StepResult::Quit => self.exit = true,
+                            StepResult::Continue => {}
+                        }
+                        return Ok(());
+                    }
                     _ => {}
                 }
 
@@ -665,7 +713,7 @@ impl App {
     }
 
     /// Returns the `StepHandler` trait object for the current step, if one exists.
-    /// Steps that are still inline in `main.rs` (Remotes, Extras, Summary)
+    /// Steps that are still inline in `main.rs` (Extras, Summary)
     /// return `None`; they'll return `Some` once extracted.
     fn current_handler(&self) -> Option<&dyn StepHandler> {
         match self.current_step() {
@@ -674,6 +722,7 @@ impl App {
             WizardStep::Languages => Some(&self.languages_handler),
             WizardStep::Workflows => Some(&self.workflows_handler),
             WizardStep::Database => Some(&self.database_handler),
+            WizardStep::Remotes => Some(&self.remotes_handler),
             _ => None,
         }
     }
@@ -690,16 +739,12 @@ impl App {
 
     fn select_or_next(&mut self) {
         match self.current_step() {
-            // handler-owned steps: input goes through handle_events's delegation branch
             WizardStep::ProjectType
             | WizardStep::Vcs
             | WizardStep::Languages
             | WizardStep::Workflows
-            | WizardStep::Database => {}
-            WizardStep::Remotes => {
-                self.config.remotes = std::mem::take(&mut self.selected_remotes);
-                self.next();
-            }
+            | WizardStep::Database
+            | WizardStep::Remotes => {}
             WizardStep::Extras => {
                 self.config.extras = std::mem::take(&mut self.selected_extras);
                 self.next();
@@ -711,23 +756,18 @@ impl App {
     fn select(&mut self) {
         debug_assert!(
             self.cursor < self.current_step().option_count()
-                || matches!(self.current_step(), WizardStep::Summary)
+                || matches!(
+                    self.current_step(),
+                    WizardStep::Summary | WizardStep::Remotes
+                )
         );
         match self.current_step() {
-            // handler-owned steps
             WizardStep::ProjectType
             | WizardStep::Vcs
             | WizardStep::Languages
             | WizardStep::Workflows
-            | WizardStep::Database => {}
-            WizardStep::Remotes => {
-                let remote = Remote::VARIANTS[self.cursor];
-                if let Some(pos) = self.selected_remotes.iter().position(|r| *r == remote) {
-                    self.selected_remotes.remove(pos);
-                } else {
-                    self.selected_remotes.push(remote);
-                }
-            }
+            | WizardStep::Database
+            | WizardStep::Remotes => {}
             WizardStep::Extras => {
                 let extra = Extra::VARIANTS[self.cursor];
                 if let Some(pos) = self.selected_extras.iter().position(|e| *e == extra) {
@@ -766,8 +806,8 @@ impl App {
                 return;
             }
             WizardStep::Remotes => {
-                self.selected_remotes.clone_from(&self.config.remotes);
-                0
+                self.remotes_handler.restore_from_config(&self.config);
+                return;
             }
             WizardStep::Extras => {
                 self.selected_extras.clone_from(&self.config.extras);
@@ -868,7 +908,7 @@ mod tests {
         assert_eq!(WizardStep::Vcs.option_count(), Vcs::VARIANTS.len());
         assert_eq!(WizardStep::Languages.option_count(), Language::VARIANTS.len());
         assert_eq!(WizardStep::Database.option_count(), 0);
-        assert_eq!(WizardStep::Remotes.option_count(), Remote::VARIANTS.len());
+        assert_eq!(WizardStep::Remotes.option_count(), 0);
         assert_eq!(WizardStep::Extras.option_count(), Extra::VARIANTS.len());
         assert_eq!(WizardStep::Summary.option_count(), 0);
     }
@@ -928,9 +968,8 @@ mod tests {
 
     #[test]
     fn cursor_down_respects_option_count() {
-        // Remotes is still inline (uses App.cursor); Database moved to a handler.
         let mut app = App {
-            step_index: step_index_of(WizardStep::Remotes),
+            step_index: step_index_of(WizardStep::Extras),
             cursor: 0,
             ..Default::default()
         };
@@ -944,7 +983,7 @@ mod tests {
     #[test]
     fn cursor_up_clamps_at_zero() {
         let mut app = App {
-            step_index: step_index_of(WizardStep::Remotes),
+            step_index: step_index_of(WizardStep::Extras),
             cursor: 2,
             ..Default::default()
         };

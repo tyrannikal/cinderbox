@@ -6,6 +6,7 @@ use crate::ProjectConfig;
 pub mod database;
 pub mod languages;
 pub mod project_type;
+pub mod remotes;
 pub mod vcs;
 pub mod workflows;
 
